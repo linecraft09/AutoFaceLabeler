@@ -1,0 +1,78 @@
+# yt-dlp configuration for video collection (YouTube & Bilibili)
+# Usage: load this YAML in Python and pass to yt_dlp.YoutubeDL
+
+# ---------- Format Selection (720p+) ----------
+# Download best video (>=720p) + best audio, fallback to best overall
+format: 'bestvideo[height>=720]+bestaudio/best'
+
+# Merge video and audio streams (requires ffmpeg)
+merge_output_format: 'mkv'               # mkv is flexible for ffmpeg post-processing
+
+# ---------- Concurrency & Speed ----------
+concurrent_fragments: 5                  # Download 5 fragments in parallel (DASH/HLS)
+# limit_rate: '2M'                       # Optional: cap download speed (bytes/sec)
+
+# ---------- Retry & Resume ----------
+retries: 10                              # Number of retries for HTTP requests
+fragment_retries: 10                     # Retries for each fragment
+continue_dl: True                        # Resume partially downloaded files (default)
+# file_access_retries: 3                # Retries on file access error
+
+# ---------- Anti-Scraping (Delay & Cookies) ----------
+# Random sleep before each download to avoid rate limiting
+sleep_interval: 5                        # Minimum seconds to sleep
+max_sleep_interval: 15                   # Maximum seconds to sleep (random between)
+
+# Use cookies from your browser (login required for some Bilibili videos)
+# Option 1: From browser (Chrome example)
+#cookiesfrombrowser: ('chrome',)          # ('chrome', 'profile_name', 'keyring')
+# Option 2: From a Netscape cookie file (uncomment the line below)
+# cookiefile: '/path/to/cookies.txt'
+
+# Custom User-Agent to mimic real browser
+user_agent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+# ---------- Output & File Management ----------
+# Output template: create subfolders by site and uploader
+outtmpl: 'E:/WorkDir/videodata/data/raw/%(id)s/%(title)s [%(id)s].%(ext)s'
+
+# Write video metadata as JSON (for future extension)
+writeinfojson: True
+
+# Write description to .description file
+writedescription: True
+
+# Do not overwrite existing files
+nooverwrites: True
+
+# Restrict filenames to ASCII (avoid filesystem issues)
+restrictfilenames: True
+
+# ---------- Post-processing ----------
+# Embed thumbnail as cover art (requires ffmpeg or mutagen)
+embedthumbnail: True
+
+# Embed subtitles (if available)
+embedsubs: True
+subtitleslangs: ['en', 'zh-Hans', 'zh-Hant']   # Download English and Chinese subs
+
+# Keep original video file after post-processing (useful for debugging)
+keepvideo: False
+
+# ---------- Logging & Progress ----------
+verbose: True                            # Print detailed debug information
+quiet: False                             # Show progress bar (default)
+# progress_with_newline: True            # Use newline for each progress update
+
+# ---------- General Behavior ----------
+ignoreerrors: True                       # Skip videos that cause errors
+abort_on_error: False                    # Do not stop on single failure
+playlistend: 999999                      # Download all items in playlist/channel
+
+# ---------- Advanced / Extensibility ----------
+# Pass custom headers if needed (example for Bilibili)
+# headers:
+#   Referer: 'https://www.bilibili.com/'
+
+# Path to custom ffmpeg binary (if not in PATH)
+ffmpeg_location: 'D:/Softwares/ffmpeg/ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe'

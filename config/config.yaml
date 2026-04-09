@@ -1,0 +1,90 @@
+explorer:
+  initial_search_terms:
+    # ========== 访谈类 (interview) ==========
+    - { text: "人物专访", platform: bilibili, category: interview, weight: 1.0 }
+    - { text: "深度访谈", platform: bilibili, category: interview, weight: 1.0 }
+    - { text: "UP主访谈", platform: bilibili, category: interview, weight: 0.9 }
+    - { text: "interview", platform: youtube, category: interview, weight: 1.0 }
+    - { text: "talk show", platform: youtube, category: interview, weight: 0.9 }
+    - { text: "Q&A", platform: youtube, category: interview, weight: 0.8 }
+    - { text: "podcast solo", platform: youtube, category: interview, weight: 0.8 }
+
+    # ========== 教育类 (educational) ==========
+    - { text: "tutorial", platform: youtube, category: educational, weight: 1.0 }
+    - { text: "how to", platform: youtube, category: educational, weight: 0.9 }
+    - { text: "lecture", platform: youtube, category: educational, weight: 0.8 }
+    - { text: "presentation", platform: youtube, category: educational, weight: 0.7 }
+    - { text: "科普讲解", platform: bilibili, category: educational, weight: 1.0 }
+    - { text: "知识分享", platform: bilibili, category: educational, weight: 0.9 }
+    - { text: "公开课", platform: bilibili, category: educational, weight: 0.8 }
+
+    # ========== Vlog类 (vlog) ==========
+    - { text: "vlog", platform: youtube, category: vlog, weight: 1.0 }
+    - { text: "daily vlog", platform: youtube, category: vlog, weight: 0.9 }
+    - { text: "solo vlog", platform: youtube, category: vlog, weight: 1.0 }
+    - { text: "morning routine", platform: youtube, category: vlog, weight: 0.7 }
+    - { text: "日常Vlog", platform: bilibili, category: vlog, weight: 1.0 }
+    - { text: "独居日常", platform: bilibili, category: vlog, weight: 0.9 }
+    - { text: "生活记录", platform: bilibili, category: vlog, weight: 0.8 }
+
+    # ========== 美妆/穿搭类 (beauty) ==========
+    - { text: "makeup tutorial", platform: youtube, category: beauty, weight: 1.0 }
+    - { text: "skincare routine", platform: youtube, category: beauty, weight: 0.9 }
+    - { text: "fashion haul", platform: youtube, category: beauty, weight: 0.8 }
+    - { text: "美妆教程", platform: bilibili, category: beauty, weight: 1.0 }
+    - { text: "穿搭分享", platform: bilibili, category: beauty, weight: 0.9 }
+    - { text: "护肤分享", platform: bilibili, category: beauty, weight: 0.8 }
+
+    # ========== 评测/解说类 (review) ==========
+    - { text: "product review", platform: youtube, category: review, weight: 1.0 }
+    - { text: "unboxing", platform: youtube, category: review, weight: 0.9 }
+    - { text: "tech review", platform: youtube, category: review, weight: 0.8 }
+    - { text: "数码评测", platform: bilibili, category: review, weight: 1.0 }
+    - { text: "游戏解说", platform: bilibili, category: review, weight: 0.8 }
+    - { text: "影视解说", platform: bilibili, category: review, weight: 0.7 }
+  llm:
+    enabled: true
+    model: "deepseek-chat"
+    api_key_env: "OPENAI_API_KEY"
+    base_url: "https://api.deepseek.com"
+    optimization_trigger_v2_pass_rate: 0.05   # 合格率低于5%触发
+  sampling:
+    target_distribution: # 目标各类型占比（保持原样）
+      interview: 0.25
+      educational: 0.25
+      vlog: 0.20
+      beauty: 0.15
+      review: 0.15
+    min_weight: 0.1
+    weight_decay_factor: 0.9       # 每次反馈后未使用的词权重衰减
+  json_file: "D:/WorkDir/AutoFaceLabeler/data/explorer.json"
+orchestrator:
+  target_qualified: 200
+
+validator1:
+  filters:
+    min_duration: 30
+    max_duration: 1800
+    min_resolution: 720
+    title_blacklist: [ "reaction", "multi", "多人", "合集", "replay" ]
+    channel_blacklist: [ "GameGrub", "群访" ]
+    min_views: 1000
+
+validator2:
+  coarse_filter:
+    single_person_threshold: 0.8
+    audio_required: true
+    model_path: 'yolo11n.pt'
+    device: 'cuda'
+  fine_filter:
+    head_pose_max_angle: 15
+    head_pose_required_ratio: 0.8
+    laplacian_threshold: 20
+    laplacian_required_ratio: 0.8
+    dedup_threshold: 0.8
+    pose_model: '6drepnet'
+    device: 'cuda'
+    speech_required: true          # 是否检测人声
+    face_db_path: 'D:/WorkDir/AutoFaceLabeler/data/face_index.faiss'
+  qualified_dir: 'E:/WorkDir/videodata/data/qualified'
+

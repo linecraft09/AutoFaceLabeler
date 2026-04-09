@@ -1,0 +1,68 @@
+# Ignore directories starting with "."
+.*/
+**/.*/
+
+# Logs
+logs/
+**/logs/
+*.log
+
+# Environment files
+.env
+.env.*
+*.env
+env/
+venv/
+.venv/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+*.mdb
+
+# LaTeX directories and artifacts
+Latex/
+**/Latex/
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.log
+*.lot
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+
+# Likely personal/sensitive files
+cookies.txt
+*.pem
+*.key
+*.p12
+*.pfx
+*secret*
+*private*
+*credential*
+*token*
+
+# AI model files
+/models/
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+*.ckpt
+*.h5
+*.pb
+*.tflite
+*.faiss
+
+# Python cache artifacts
+__pycache__/
+*.pyc
+*.pyo

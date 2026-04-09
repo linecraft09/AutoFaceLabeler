@@ -1,0 +1,15 @@
+PyYAML
+yt_dlp
+python-dotenv
+openai
+numpy
+faiss
+opencv-python
+torch
+torchvision
+torchaudio
+modelscope
+ultralytics
+onnxruntime-gpu
+insightface
+soundfile
