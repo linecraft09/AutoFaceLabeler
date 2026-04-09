@@ -20,6 +20,7 @@ venv/
 *.sqlite
 *.sqlite3
 *.mdb
+data/explorer.json
 
 # LaTeX directories and artifacts
 Latex/
