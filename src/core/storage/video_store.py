@@ -1,12 +1,24 @@
 import json
 import sqlite3
+from enum import Enum
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Set, Tuple
+from typing import List, Optional, Dict, Any, Set, Tuple, Union
 
 from aflutils.logger import get_logger
 from core.models.video_meta import VideoMeta
 
 logger = get_logger(__name__)
+
+
+class VideoStatus(str, Enum):
+    PENDING = "pending"
+    DOWNLOADED = "downloaded"
+    V1_FAILED = "v1_failed"
+    V1_PASSED = "v1_passed"
+    V2_PASSED = "v2_passed"
+    V2_FAILED = "v2_failed"
+    V2_COARSE_FAILED = "v2_coarse_failed"
+    V2_FINE_FAILED = "v2_fine_failed"
 
 
 class VideoStore:
@@ -59,6 +71,28 @@ class VideoStore:
             """)
             logger.info(f"VideoStore initialized at {self.db_path}")
 
+    @staticmethod
+    def _normalize_status(status: Union[str, VideoStatus]) -> str:
+        if isinstance(status, VideoStatus):
+            return status.value
+        if isinstance(status, str):
+            normalized = status.strip().lower()
+            if normalized in {s.value for s in VideoStatus}:
+                return normalized
+            logger.warning(f"Unknown status '{status}', storing as-is for backward compatibility")
+            return status
+        raise TypeError(f"status must be str or VideoStatus, got {type(status).__name__}")
+
+    @staticmethod
+    def _deserialize_tags(record: Dict[str, Any]) -> Dict[str, Any]:
+        tags = record.get("tags")
+        if isinstance(tags, str):
+            try:
+                record["tags"] = json.loads(tags)
+            except json.JSONDecodeError:
+                logger.warning("Invalid JSON tags in record, keeping raw string")
+        return record
+
     def insert_or_update(self, video: VideoMeta, file_path: Optional[str] = None) -> bool:
         """插入或更新视频记录（基于 video_id + platform）"""
         try:
@@ -94,7 +128,7 @@ class VideoStore:
                     json.dumps(video.tags),  # 存储为 JSON
                     video.search_term,
                     file_path,
-                    'downloaded'
+                    VideoStatus.DOWNLOADED.value
                 ))
             logger.debug(f"Stored video {video.video_id} from {video.platform}")
             return True
@@ -102,23 +136,30 @@ class VideoStore:
             logger.error(f"Failed to store video {video.video_id}: {e}")
             return False
 
-    def update_status(self, video_id: str, platform: str, status: str, fail_reason: str = None):
+    def update_status(
+        self,
+        video_id: str,
+        platform: str,
+        status: Union[str, VideoStatus],
+        fail_reason: str = None
+    ):
         """更新视频状态（供 V2 使用）"""
+        normalized_status = self._normalize_status(status)
         with self._connect() as conn:
             conn.execute("""
                 UPDATE videos SET status = ?, v2_fail_reason = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE video_id = ? AND platform = ?
-            """, (status, fail_reason, video_id, platform))
+            """, (normalized_status, fail_reason, video_id, platform))
 
     def get_pending_videos(self, limit: int = 100) -> List[Dict[str, Any]]:
         """获取状态为 'downloaded' 且尚未经过 V2 过滤的视频"""
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("""
-                SELECT * FROM videos WHERE status = 'downloaded' ORDER BY created_at LIMIT ?
-            """, (limit,))
+                SELECT * FROM videos WHERE status = ? ORDER BY created_at LIMIT ?
+            """, (VideoStatus.DOWNLOADED.value, limit))
             rows = cursor.fetchall()
-            return [dict(row) for row in rows]
+            return [self._deserialize_tags(dict(row)) for row in rows]
 
     def get_video_by_id(self, video_id: str, platform: str) -> Optional[Dict]:
         with self._connect() as conn:
@@ -127,7 +168,7 @@ class VideoStore:
                 SELECT * FROM videos WHERE video_id = ? AND platform = ?
             """, (video_id, platform))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            return self._deserialize_tags(dict(row)) if row else None
 
     def get_statistics(self) -> Dict[str, int]:
         """获取各状态的数量统计"""
@@ -155,13 +196,16 @@ class VideoStore:
 
     def get_file_paths_by_excluded_statuses(
         self,
-        excluded_statuses: Tuple[str, ...] = ("downloaded", "v2_passed")
+        excluded_statuses: Tuple[Union[str, VideoStatus], ...] = (
+            VideoStatus.DOWNLOADED.value, VideoStatus.V2_PASSED.value
+        )
     ) -> List[str]:
         """获取不在排除状态中的 file_path 列表（去重后返回）。"""
         if not excluded_statuses:
             return []
 
-        placeholders = ",".join("?" for _ in excluded_statuses)
+        normalized_excluded = tuple(self._normalize_status(s) for s in excluded_statuses)
+        placeholders = ",".join("?" for _ in normalized_excluded)
         sql = f"""
             SELECT DISTINCT file_path FROM videos
             WHERE file_path IS NOT NULL
@@ -169,12 +213,14 @@ class VideoStore:
               AND status NOT IN ({placeholders})
         """
         with self._connect() as conn:
-            cursor = conn.execute(sql, list(excluded_statuses))
+            cursor = conn.execute(sql, list(normalized_excluded))
             return [row[0] for row in cursor.fetchall()]
 
     def claim_file_paths_by_excluded_statuses(
         self,
-        excluded_statuses: Tuple[str, ...] = ("downloaded", "v2_passed")
+        excluded_statuses: Tuple[Union[str, VideoStatus], ...] = (
+            VideoStatus.DOWNLOADED.value, VideoStatus.V2_PASSED.value
+        )
     ) -> List[str]:
         """
         原子化领取可清理的视频文件路径：
@@ -185,8 +231,9 @@ class VideoStore:
         if not excluded_statuses:
             return []
 
-        placeholders = ",".join("?" for _ in excluded_statuses)
-        params = list(excluded_statuses)
+        normalized_excluded = tuple(self._normalize_status(s) for s in excluded_statuses)
+        placeholders = ",".join("?" for _ in normalized_excluded)
+        params = list(normalized_excluded)
 
         select_sql = f"""
             SELECT DISTINCT v.file_path

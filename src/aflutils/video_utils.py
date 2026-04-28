@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional
 
@@ -126,6 +127,9 @@ def get_video_secs(video_path: str) -> float:
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
+    if fps is None or not math.isfinite(fps) or fps <= 0:
+        logger.warning(f"Invalid FPS ({fps}) for {video_path}, returning 0.0 seconds")
+        return 0.0
     return total_frames / fps
 
 

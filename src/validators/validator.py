@@ -291,76 +291,75 @@ class V2ContentFilter:
     def _process_single_video(self, video_path: str) -> Tuple[
         str, bool, Optional[Tuple[float, float, np.ndarray]], Optional[str]]:
         cap = cv2.VideoCapture(video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames == 0:
+        try:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames == 0:
+                return video_path, False, None, 'no_frames'
+
+            sample_count = max(1, min(200, int(total_frames * 0.1)))
+            sample_indices = np.linspace(0, total_frames - 1, sample_count, dtype=int)
+            sample_indices_set = set(int(i) for i in sample_indices.tolist())
+            sample_count = len(sample_indices_set)
+
+            good_pose_count = 0
+            good_clarity_count = 0
+            sampled_face_detected = 0
+            representative_embedding = None
+
+            if self.speech_required:
+                # speaker_detector is used in read-only mode here.
+                has_speech = self.speaker_detector.detect_speech_from_video(video_path)
+                if not has_speech:
+                    return video_path, False, None, 'no_speech'
+
+            for frame_idx in range(total_frames):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if frame_idx not in sample_indices_set:
+                    continue
+
+                face = self.face_embedder.extract(frame)
+                if not face:
+                    continue
+
+                sampled_face_detected += 1
+
+                bbox = face.bbox.astype(int)
+                face_img = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+                if face_img.size == 0:
+                    continue
+
+                pose_rad = face.pose
+                roll = pose_rad[0]
+                pitch = pose_rad[1]
+                yaw = pose_rad[2]
+
+                max_angle = self.max_head_angle
+                if abs(yaw) <= max_angle and abs(pitch) <= max_angle and abs(roll) <= max_angle:
+                    good_pose_count += 1
+
+                clarity = compute_laplacian_variance(face_img)
+                if clarity > self.laplacian_threshold:
+                    good_clarity_count += 1
+
+                if representative_embedding is None:
+                    representative_embedding = face.normed_embedding
+
+            if sampled_face_detected <= sample_count * 0.8:
+                return video_path, False, None, 'no_face_detected'
+
+            pose_ratio = good_pose_count / sampled_face_detected
+            clarity_ratio = good_clarity_count / sampled_face_detected
+
+            if pose_ratio < self.head_pose_required_ratio:
+                return video_path, False, None, 'head_pose_out_of_range'
+            if clarity_ratio < self.laplacian_required_ratio:
+                return video_path, False, None, 'blurry_face'
+
+            return video_path, True, (pose_ratio, clarity_ratio, representative_embedding), None
+        finally:
             cap.release()
-            return video_path, False, None, 'no_frames'
-
-        sample_count = max(1, min(200, int(total_frames * 0.1)))
-        sample_indices = np.linspace(0, total_frames - 1, sample_count, dtype=int)
-        sample_indices_set = set(int(i) for i in sample_indices.tolist())
-        sample_count = len(sample_indices_set)
-
-        good_pose_count = 0
-        good_clarity_count = 0
-        sampled_face_detected = 0
-        representative_embedding = None
-
-        if self.speech_required:
-            # speaker_detector is used in read-only mode here.
-            has_speech = self.speaker_detector.detect_speech_from_video(video_path)
-            if not has_speech:
-                cap.release()
-                return video_path, False, None, 'no_speech'
-
-        for frame_idx in range(total_frames):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if frame_idx not in sample_indices_set:
-                continue
-
-            face = self.face_embedder.extract(frame)
-            if not face:
-                continue
-
-            sampled_face_detected += 1
-
-            bbox = face.bbox.astype(int)
-            face_img = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-            if face_img.size == 0:
-                continue
-
-            pose_rad = face.pose
-            roll = pose_rad[0]
-            pitch = pose_rad[1]
-            yaw = pose_rad[2]
-
-            max_angle = self.max_head_angle
-            if abs(yaw) <= max_angle and abs(pitch) <= max_angle and abs(roll) <= max_angle:
-                good_pose_count += 1
-
-            clarity = compute_laplacian_variance(face_img)
-            if clarity > self.laplacian_threshold:
-                good_clarity_count += 1
-
-            if representative_embedding is None:
-                representative_embedding = face.normed_embedding
-
-        cap.release()
-
-        if sampled_face_detected <= sample_count * 0.8:
-            return video_path, False, None, 'no_face_detected'
-
-        pose_ratio = good_pose_count / sampled_face_detected
-        clarity_ratio = good_clarity_count / sampled_face_detected
-
-        if pose_ratio < self.head_pose_required_ratio:
-            return video_path, False, None, 'head_pose_out_of_range'
-        if clarity_ratio < self.laplacian_required_ratio:
-            return video_path, False, None, 'blurry_face'
-
-        return video_path, True, (pose_ratio, clarity_ratio, representative_embedding), None
 
     def _update_feedback(self, fail_reason: str):
         if fail_reason in self.feedback['fail_reasons']:

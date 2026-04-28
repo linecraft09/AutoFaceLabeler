@@ -1,4 +1,5 @@
 import random
+import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
@@ -54,7 +55,7 @@ class YtDlpSearchApi(SearchApi):
             self.ydl_opts_fast['user_agent'] = user_agent
 
         # 详细配置（用于获取单个视频详情，extract_flat=False）
-        self.ydl_opts_detail = self.ydl_opts_fast.copy()
+        self.ydl_opts_detail = copy.deepcopy(self.ydl_opts_fast)
         self.ydl_opts_detail['extract_flat'] = False
         self.ydl_opts_detail['cookiefile'] = None
         # 详细模式可能需要更长的超时
@@ -69,6 +70,8 @@ class YtDlpSearchApi(SearchApi):
         1. 快速扁平搜索，获取视频列表（无分辨率）。
         2. 对每个视频单独请求详情，提取真实分辨率。
         """
+        max_results = max(1, min(max_results, 50))
+
         if self.platform == 'youtube':
             search_query = f"ytsearch{max_results}:{query}"
         else:  # bilibili
