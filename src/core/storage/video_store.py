@@ -171,3 +171,50 @@ class VideoStore:
         with self._connect() as conn:
             cursor = conn.execute(sql, list(excluded_statuses))
             return [row[0] for row in cursor.fetchall()]
+
+    def claim_file_paths_by_excluded_statuses(
+        self,
+        excluded_statuses: Tuple[str, ...] = ("downloaded", "v2_passed")
+    ) -> List[str]:
+        """
+        原子化领取可清理的视频文件路径：
+        1) 在单个事务中查询可清理路径；
+        2) 将这些路径对应记录的 file_path 置空，避免并发重复清理；
+        3) 返回被领取的路径列表。
+        """
+        if not excluded_statuses:
+            return []
+
+        placeholders = ",".join("?" for _ in excluded_statuses)
+        params = list(excluded_statuses)
+
+        select_sql = f"""
+            SELECT DISTINCT v.file_path
+            FROM videos v
+            WHERE v.file_path IS NOT NULL
+              AND v.file_path != ''
+              AND v.status NOT IN ({placeholders})
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM videos keep
+                    WHERE keep.file_path = v.file_path
+                      AND keep.status IN ({placeholders})
+              )
+        """
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(select_sql, params + params)
+            claimed_paths = [row[0] for row in cursor.fetchall()]
+            if not claimed_paths:
+                return []
+
+            update_path_placeholders = ",".join("?" for _ in claimed_paths)
+            update_sql = f"""
+                UPDATE videos
+                SET file_path = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE file_path IN ({update_path_placeholders})
+                  AND status NOT IN ({placeholders})
+            """
+            conn.execute(update_sql, claimed_paths + params)
+            return claimed_paths

@@ -1,4 +1,5 @@
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
 import yt_dlp
@@ -40,8 +41,8 @@ class YtDlpSearchApi(SearchApi):
             'sleep_interval': random.uniform(3, 6),
             'max_sleep_interval': 10,
             'sleep_interval_requests': random.uniform(2, 5),
-            'cookiefile': r'D:\WorkDir\AutoFaceLabeler\cookies.txt',  # 原始字符串
-            'nocheckcertificate': True,
+            # 'cookiefile': 'cookies.txt',  # 取消注释并设置路径以使用 cookie
+            'nocheckcertificate': False,
             'prefer_insecure': False,
             'extractor_retries': 3,
             'file_access_retries': 3,
@@ -116,14 +117,32 @@ class YtDlpSearchApi(SearchApi):
 
         # 阶段2：对每个条目获取详细信息
         results = []
+        entry_with_urls = []
         for entry in unique_entries:
             video_url = entry.get('webpage_url') or entry.get('url')
             if not video_url:
                 logger.warning(f"Skipping entry without URL: {entry}")
                 continue
+            entry_with_urls.append((entry, video_url))
 
+        details_by_url = {}
+        if entry_with_urls:
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_url = {
+                    executor.submit(self._get_video_details, video_url): video_url
+                    for _, video_url in entry_with_urls
+                }
+                for future in as_completed(future_to_url):
+                    video_url = future_to_url[future]
+                    try:
+                        details_by_url[video_url] = future.result()
+                    except Exception as e:
+                        logger.error(f"Failed to get details for {video_url}: {e}")
+                        details_by_url[video_url] = None
+
+        for entry, video_url in entry_with_urls:
             # 获取详细信息
-            details = self._get_video_details(video_url)
+            details = details_by_url.get(video_url)
             if not details:
                 logger.warning(f"Failed to get details for {video_url}, skipping")
                 continue

@@ -1,5 +1,6 @@
 # src/explorer/llm_optimizer.py
 import os
+from pathlib import Path
 from typing import List, Dict, Optional
 
 from dotenv import load_dotenv
@@ -8,7 +9,8 @@ from openai import OpenAI
 from aflutils.logger import get_logger
 
 logger = get_logger(__name__)
-load_dotenv("D:/WorkDir/AutoFaceLabeler/api_key.env")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+load_dotenv(PROJECT_ROOT / "api_key.env")
 
 
 class LLMOptimizer:
