@@ -14,6 +14,7 @@ Subclasses must implement:
 
 import logging
 import os
+from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any
 
 import yaml
@@ -24,7 +25,7 @@ from aflutils.logger import get_logger
 logger = get_logger(__name__)
 
 
-class BaseDownloader:
+class BaseDownloader(ABC):
     """Abstract base class for video downloader using yt-dlp."""
 
     def __init__(
@@ -96,6 +97,20 @@ class BaseDownloader:
         """
         self.logger.error(f"Failed to download {url}: {error}")
 
+    @abstractmethod
+    def get_options_for_url(self, url: str) -> Dict[str, Any]:
+        """
+        Return yt-dlp options for a specific URL.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def on_download_complete(self, url: str, info: Dict[str, Any]) -> None:
+        """
+        Hook called after a successful yt-dlp extraction.
+        """
+        raise NotImplementedError
+
     def _download_single(self, url: str) -> Optional[str]:
         """
         Download a single video using yt-dlp.
@@ -108,6 +123,7 @@ class BaseDownloader:
         """
         # Merge base config with URL‑specific options
         options = self.config.copy()
+        options.update(self.get_options_for_url(url) or {})
 
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
@@ -126,6 +142,8 @@ class BaseDownloader:
                                 break
                 else:
                     file_path = self._get_downloaded_file_path(ydl, info)
+
+                self.on_download_complete(url, info)
 
                 if file_path and os.path.exists(file_path):
                     self.logger.info(f"Download completed: {file_path}")
@@ -175,3 +193,13 @@ class BaseDownloader:
             f"Collection finished. Success: {sum([1 if r else 0 for r in results.values()])} / {len(results)}"
         )
         return results
+
+
+class DefaultDownloader(BaseDownloader):
+    """Default downloader with no per-URL option overrides."""
+
+    def get_options_for_url(self, url: str) -> Dict[str, Any]:
+        return {}
+
+    def on_download_complete(self, url: str, info: Dict[str, Any]) -> None:
+        self.logger.debug(f"Download metadata processed for URL: {url}")

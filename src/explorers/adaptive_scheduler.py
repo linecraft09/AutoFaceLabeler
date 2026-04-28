@@ -1,4 +1,4 @@
-# src/explorer/adaptive_scheduler.py
+# src/explorers/adaptive_scheduler.py
 import os
 from typing import List, Dict, Any
 

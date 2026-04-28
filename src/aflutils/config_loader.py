@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any, Dict, Union
 
 import yaml
+from aflutils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class ConfigLoader:
@@ -41,9 +44,70 @@ class ConfigLoader:
             self._raw_config = yaml.safe_load(f) or {}
 
         self._config = self._raw_config.copy()
+        self._validate_schema(self._config)
         if load_env:
             self._config = self._replace_env_vars(self._config)
+            self._validate_schema(self._config)
         return self
+
+    def _validate_schema(self, config: Dict[str, Any]) -> None:
+        """轻量级配置校验：检查关键路径类型与未知键。"""
+        expected_schema: Dict[str, Any] = {
+            "orchestrator": {
+                "target_qualified": int,
+            },
+            "validator2": {
+                "coarse_filter": {
+                    "model_path": str,
+                },
+                "fine_filter": {
+                    "face_db_path": str,
+                },
+                "qualified_dir": str,
+            },
+        }
+
+        def _type_name(t: Any) -> str:
+            return getattr(t, "__name__", str(t))
+
+        def _validate_required(node: Any, schema_node: Any, prefix: str = "") -> None:
+            if not isinstance(schema_node, dict):
+                return
+            if not isinstance(node, dict):
+                logger.warning(
+                    f"Config key '{prefix or '<root>'}' should be a mapping, got {type(node).__name__}"
+                )
+                return
+
+            for key, expected in schema_node.items():
+                key_path = f"{prefix}.{key}" if prefix else key
+                if key not in node:
+                    logger.warning(f"Missing required config key: {key_path}")
+                    continue
+                value = node[key]
+                if isinstance(expected, dict):
+                    _validate_required(value, expected, key_path)
+                elif not isinstance(value, expected):
+                    logger.warning(
+                        f"Invalid type for '{key_path}': expected {_type_name(expected)}, "
+                        f"got {type(value).__name__}"
+                    )
+
+        def _warn_unexpected(node: Any, schema_node: Any, prefix: str = "") -> None:
+            if not isinstance(schema_node, dict) or not isinstance(node, dict):
+                return
+            expected_keys = set(schema_node.keys())
+            for key, value in node.items():
+                key_path = f"{prefix}.{key}" if prefix else key
+                if key not in expected_keys:
+                    logger.warning(f"Unexpected config key: {key_path}")
+                    continue
+                _warn_unexpected(value, schema_node[key], key_path)
+
+        _validate_required(config, expected_schema)
+        for scoped_key in ("orchestrator", "validator2"):
+            if scoped_key in config and scoped_key in expected_schema:
+                _warn_unexpected(config[scoped_key], expected_schema[scoped_key], scoped_key)
 
     def _replace_env_vars(self, obj: Any) -> Any:
         """递归替换对象中的环境变量"""

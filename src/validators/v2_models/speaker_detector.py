@@ -20,8 +20,8 @@ class SpeakerDetector:
         self.device = device
         self.vad_pipeline = pipeline(
             task=Tasks.voice_activity_detection,
-            model="C:/Users/linecraft/.cache/modelscope/hub/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-            local_files_only=True
+            model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+            local_files_only=False
         )
 
     def detect_speech(self, audio_path: str) -> bool:
@@ -39,7 +39,16 @@ class SpeakerDetector:
             result: List[Dict[str, List[int]]] = self.vad_pipeline(audio_np, sample_rate)
 
             if result and len(result) > 0 and len(result[0]) > 0:
-                segments = list(result[0].values())[0]
+                first = result[0]
+                segments = first.get('value')
+                if segments is None:
+                    # Backward compatibility for possible schema variants.
+                    segments = first.get('segments')
+                if segments is None and 'text' in first and isinstance(first.get('text'), list):
+                    segments = first.get('text')
+                if segments is None:
+                    logger.warning(f"Unexpected VAD output keys: {list(first.keys())}")
+                    return False
                 return len(segments) > 0
 
             return False

@@ -1,0 +1,51 @@
+# Integration test config — minimal scope, exercise all pipeline stages
+# Data paths use /tmp to avoid polluting the repo
+explorer:
+  initial_search_terms:
+    - { text: "tutorial", platform: youtube, category: educational, weight: 1.0 }
+    - { text: "vlog", platform: youtube, category: vlog, weight: 1.0 }
+    - { text: "科普讲解", platform: bilibili, category: educational, weight: 1.0 }
+  llm:
+    enabled: false
+    model: "deepseek-chat"
+    api_key_env: "OPENAI_API_KEY"
+    base_url: "https://api.deepseek.com"
+    optimization_trigger_v2_pass_rate: 0.05
+  sampling:
+    target_distribution:
+      interview: 0.33
+      educational: 0.34
+      vlog: 0.33
+    min_weight: 0.1
+    weight_decay_factor: 0.9
+  json_file: "/tmp/afl_explorer_test.json"
+
+orchestrator:
+  target_qualified: 1
+
+validator1:
+  filters:
+    min_duration: 10
+    max_duration: 1800
+    min_resolution: 360
+    title_blacklist: ["reaction", "multi", "多人", "合集", "replay"]
+    channel_blacklist: ["GameGrub", "群访"]
+    min_views: 0
+
+validator2:
+  coarse_filter:
+    single_person_threshold: 0.15   # Very low for testing — most real videos fail at 0.5
+    audio_required: false           # Many short clips lack audio
+    model_path: 'yolo11n.pt'
+    device: 'cuda'
+  fine_filter:
+    head_pose_max_angle: 45         # Relaxed for test
+    head_pose_required_ratio: 0.3   # Relaxed
+    laplacian_threshold: 5          # Relaxed
+    laplacian_required_ratio: 0.3   # Relaxed
+    dedup_threshold: 0.99           # Very loose — accept near duplicates in test
+    pose_model: '6drepnet'
+    device: 'cuda'
+    speech_required: false
+    face_db_path: '/tmp/afl_test_faces.faiss'
+  qualified_dir: '/tmp/afl_qualified_test'

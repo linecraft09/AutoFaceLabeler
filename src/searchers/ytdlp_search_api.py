@@ -1,7 +1,11 @@
 import random
+import copy
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
 import yt_dlp
+from yt_dlp.utils import DownloadError, ExtractorError
 
 from aflutils.logger import get_logger
 from core.models.video_meta import VideoMeta
@@ -9,6 +13,14 @@ from core.storage.video_store import VideoStore
 from .search_api import SearchApi
 
 logger = get_logger(__name__)
+
+
+class SearchRateLimitError(Exception):
+    pass
+
+
+class SearchNetworkError(Exception):
+    pass
 
 
 class YtDlpSearchApi(SearchApi):
@@ -40,8 +52,8 @@ class YtDlpSearchApi(SearchApi):
             'sleep_interval': random.uniform(3, 6),
             'max_sleep_interval': 10,
             'sleep_interval_requests': random.uniform(2, 5),
-            'cookiefile': r'D:\WorkDir\AutoFaceLabeler\cookies.txt',  # 原始字符串
-            'nocheckcertificate': True,
+            # 'cookiefile': 'cookies.txt',  # 取消注释并设置路径以使用 cookie
+            'nocheckcertificate': False,
             'prefer_insecure': False,
             'extractor_retries': 3,
             'file_access_retries': 3,
@@ -53,7 +65,7 @@ class YtDlpSearchApi(SearchApi):
             self.ydl_opts_fast['user_agent'] = user_agent
 
         # 详细配置（用于获取单个视频详情，extract_flat=False）
-        self.ydl_opts_detail = self.ydl_opts_fast.copy()
+        self.ydl_opts_detail = copy.deepcopy(self.ydl_opts_fast)
         self.ydl_opts_detail['extract_flat'] = False
         self.ydl_opts_detail['cookiefile'] = None
         # 详细模式可能需要更长的超时
@@ -68,6 +80,8 @@ class YtDlpSearchApi(SearchApi):
         1. 快速扁平搜索，获取视频列表（无分辨率）。
         2. 对每个视频单独请求详情，提取真实分辨率。
         """
+        max_results = max(1, min(max_results, 50))
+
         if self.platform == 'youtube':
             search_query = f"ytsearch{max_results}:{query}"
         else:  # bilibili
@@ -81,9 +95,21 @@ class YtDlpSearchApi(SearchApi):
                 if not entries:
                     logger.warning(f"No entries found for query '{query}'")
                     return []
-            except Exception as e:
-                logger.error(f"Fast search failed for query '{query}': {e}")
+            except (DownloadError, ExtractorError) as e:
+                kind = self._classify_ytdlp_error(e)
+                if kind == "rate_limit":
+                    backoff = 5
+                    logger.error(f"Rate limited for query '{query}', backoff {backoff}s: {e}")
+                    time.sleep(backoff)
+                    raise SearchRateLimitError(str(e)) from e
+                if kind == "network":
+                    logger.error(f"Network failure for query '{query}': {e}")
+                    raise SearchNetworkError(str(e)) from e
+                logger.warning(f"No results or unsupported query '{query}': {e}")
                 return []
+            except Exception as e:
+                logger.error(f"Unexpected fast search failure for query '{query}': {e}", exc_info=True)
+                raise
         logger.info(f"Search for {query} on {self.platform} receive {len(entries)} video infos")
 
         # 快速扁平搜索结束后先去重：
@@ -116,14 +142,32 @@ class YtDlpSearchApi(SearchApi):
 
         # 阶段2：对每个条目获取详细信息
         results = []
+        entry_with_urls = []
         for entry in unique_entries:
             video_url = entry.get('webpage_url') or entry.get('url')
             if not video_url:
                 logger.warning(f"Skipping entry without URL: {entry}")
                 continue
+            entry_with_urls.append((entry, video_url))
 
+        details_by_url = {}
+        if entry_with_urls:
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_url = {
+                    executor.submit(self._get_video_details, video_url): video_url
+                    for _, video_url in entry_with_urls
+                }
+                for future in as_completed(future_to_url):
+                    video_url = future_to_url[future]
+                    try:
+                        details_by_url[video_url] = future.result()
+                    except Exception as e:
+                        logger.error(f"Failed to get details for {video_url}: {e}")
+                        details_by_url[video_url] = None
+
+        for entry, video_url in entry_with_urls:
             # 获取详细信息
-            details = self._get_video_details(video_url)
+            details = details_by_url.get(video_url)
             if not details:
                 logger.warning(f"Failed to get details for {video_url}, skipping")
                 continue
@@ -159,9 +203,32 @@ class YtDlpSearchApi(SearchApi):
             try:
                 info = ydl.extract_info(url, download=False)
                 return info
-            except Exception as e:
-                logger.error(f"Failed to get details for {url}: {e}")
+            except (DownloadError, ExtractorError) as e:
+                kind = self._classify_ytdlp_error(e)
+                if kind == "network":
+                    logger.error(f"Network error while fetching details for {url}: {e}")
+                elif kind == "rate_limit":
+                    logger.error(f"Rate limit while fetching details for {url}: {e}")
+                else:
+                    logger.warning(f"No detail result for {url}: {e}")
                 return None
+            except Exception as e:
+                logger.error(f"Unexpected error getting details for {url}: {e}", exc_info=True)
+                return None
+
+    @staticmethod
+    def _classify_ytdlp_error(exc: Exception) -> str:
+        msg = str(exc).lower()
+        if any(k in msg for k in ("429", "too many requests", "rate limit", "ratelimit")):
+            return "rate_limit"
+        if any(k in msg for k in (
+                "timed out", "timeout", "connection", "network", "name resolution", "temporary failure",
+                "connection reset", "proxy error", "unreachable"
+        )):
+            return "network"
+        if any(k in msg for k in ("no results", "did not match any", "not found", "video unavailable")):
+            return "no_results"
+        return "other"
 
     @staticmethod
     def _extract_resolution_from_details(details: dict) -> str:

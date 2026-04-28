@@ -1,4 +1,5 @@
-# src/explorer/search_term_pool.py
+# src/explorers/search_term_pool.py
+import threading
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
@@ -48,6 +49,7 @@ class SearchTermPool:
         self.target_dist = target_distribution
         self.min_weight = min_weight
         self.weight_decay_factor = weight_decay_factor
+        self._lock = threading.Lock()
 
         self.terms: List[SearchTerm] = []
         for t in initial_terms:
@@ -75,19 +77,21 @@ class SearchTermPool:
 
     def update_weights(self, term_text: str, delta: float):
         """调整某个词的权重（增量）"""
-        term = self._find_term(term_text)
-        if term:
-            term.weight += delta
-            if term.weight < self.min_weight:
-                term.weight = self.min_weight
-            # 重新归一化该类别的权重
-            self._normalize_weights()
+        with self._lock:
+            term = self._find_term(term_text)
+            if term:
+                term.weight += delta
+                if term.weight < self.min_weight:
+                    term.weight = self.min_weight
+                # 重新归一化该类别的权重
+                self._normalize_weights()
 
     def set_weight(self, term_text: str, new_weight: float):
-        term = self._find_term(term_text)
-        if term:
-            term.weight = max(self.min_weight, new_weight)
-            self._normalize_weights()
+        with self._lock:
+            term = self._find_term(term_text)
+            if term:
+                term.weight = max(self.min_weight, new_weight)
+                self._normalize_weights()
 
     def _find_term(self, text: str) -> Optional[SearchTerm]:
         for t in self.terms:
@@ -100,24 +104,37 @@ class SearchTermPool:
                      total_tried: int = None, total_downloaded: int = None,
                      total_qualified: int = None):
         """更新搜索词的统计信息（增量或覆盖）"""
-        term = self._find_term(term_text)
-        if not term:
-            logger.warning(f"Term '{term_text}' not found in pool")
-            return
+        with self._lock:
+            term = self._find_term(term_text)
+            if not term:
+                logger.warning(f"Term '{term_text}' not found in pool")
+                return
 
-        if v1_pass_rate is not None:
-            term.stats.v1_pass_rate = v1_pass_rate
-        if v2_pass_rate is not None:
-            term.stats.v2_pass_rate = v2_pass_rate
-        if total_tried is not None:
-            term.stats.total_tried += total_tried
-        if total_downloaded is not None:
-            term.stats.total_downloaded += total_downloaded
-        if total_qualified is not None:
-            term.stats.total_qualified += total_qualified
-        if failure_reasons:
-            for k, v in failure_reasons.items():
-                term.stats.failure_reasons[k] = term.stats.failure_reasons.get(k, 0) + v
+            if v1_pass_rate is not None:
+                term.stats.v1_pass_rate = v1_pass_rate
+            if v2_pass_rate is not None:
+                term.stats.v2_pass_rate = v2_pass_rate
+            if total_tried is not None:
+                term.stats.total_tried += total_tried
+            if total_downloaded is not None:
+                term.stats.total_downloaded += total_downloaded
+            if total_qualified is not None:
+                term.stats.total_qualified += total_qualified
+            if failure_reasons:
+                for k, v in failure_reasons.items():
+                    term.stats.failure_reasons[k] = term.stats.failure_reasons.get(k, 0) + v
+
+    def _sample_category_unlocked(self, batch_size: int, category: str) -> List[SearchTerm]:
+        terms_in_cat = [t for t in self.terms if t.category == category]
+        if not terms_in_cat:
+            return []
+        weights = [t.weight for t in terms_in_cat]
+        total_weight = sum(weights)
+        if total_weight == 0:
+            return []
+        probs = [w / total_weight for w in weights]
+        indices = np.random.choice(len(terms_in_cat), size=batch_size, p=probs, replace=True)
+        return [terms_in_cat[i] for i in indices]
 
     def sample(self, batch_size: int, category: Optional[str] = None) -> List[SearchTerm]:
         """
@@ -126,23 +143,17 @@ class SearchTermPool:
         :param category: 若指定，只从该类别采样；否则按目标分布从各层采样
         :return: SearchTerm 列表（可重复）
         """
-        if category:
-            # 单一类别采样
-            terms_in_cat = [t for t in self.terms if t.category == category]
-            if not terms_in_cat:
-                return []
-            weights = [t.weight for t in terms_in_cat]
-            total_weight = sum(weights)
-            if total_weight == 0:
-                return []
-            probs = [w / total_weight for w in weights]
-            indices = np.random.choice(len(terms_in_cat), size=batch_size, p=probs, replace=True)
-            return [terms_in_cat[i] for i in indices]
-        else:
+        with self._lock:
+            if category:
+                # 单一类别采样
+                return self._sample_category_unlocked(batch_size, category)
+
             # 分层采样：按目标分布决定每个类别采多少
             samples = []
             # 确保所有类别都在 target_dist 中，否则使用均匀分布
             categories = set(t.category for t in self.terms)
+            if not categories:
+                return []
             target = self.target_dist.copy()
             for cat in categories:
                 if cat not in target:
@@ -168,26 +179,44 @@ class SearchTermPool:
             for cat, count in counts.items():
                 if count <= 0:
                     continue
-                cat_samples = self.sample(count, category=cat)
+                cat_samples = self._sample_category_unlocked(count, cat)
                 samples.extend(cat_samples)
             return samples
 
-    def add_term(self, text: str, category: str, weight: float = 1.0,
-                 original_text: Optional[str] = None, generation_round: int = 0):
+    def add_term(self, text: str, *args, **kwargs):
         """添加新的搜索词（如 LLM 生成的）"""
-        if self._find_term(text):
-            logger.warning(f"Term '{text}' already exists, skipping")
-            return
-        term = SearchTerm(
-            text=text,
-            category=category,
-            weight=weight,
-            original_text=original_text,
-            generation_round=generation_round
-        )
-        self.terms.append(term)
-        self._normalize_weights()
-        logger.info(f"Added new term: {text} (category={category})")
+        # Backward-compatible signatures:
+        # 1) add_term(text, category, weight=..., original_text=..., generation_round=...)
+        # 2) add_term(text, platform, category, weight=..., original_text=..., generation_round=...)
+        if len(args) >= 2:
+            category = args[1]
+            weight = kwargs.pop("weight", 1.0)
+        elif len(args) == 1:
+            category = args[0]
+            weight = kwargs.pop("weight", 1.0)
+        else:
+            category = kwargs.pop("category")
+            weight = kwargs.pop("weight", 1.0)
+
+        original_text = kwargs.pop("original_text", None)
+        generation_round = kwargs.pop("generation_round", 0)
+        if kwargs:
+            raise TypeError(f"Unexpected keyword arguments: {', '.join(kwargs.keys())}")
+
+        with self._lock:
+            if self._find_term(text):
+                logger.warning(f"Term '{text}' already exists, skipping")
+                return
+            term = SearchTerm(
+                text=text,
+                category=category,
+                weight=weight,
+                original_text=original_text,
+                generation_round=generation_round
+            )
+            self.terms.append(term)
+            self._normalize_weights()
+            logger.info(f"Added new term: {text} (category={category})")
 
     def get_underperforming_terms(self, v2_pass_threshold: float = 0.05,
                                   v1_pass_threshold: float = 0.1) -> List[SearchTerm]:
@@ -196,47 +225,50 @@ class SearchTermPool:
         :param v2_pass_threshold: 最终合格率低于此值视为差
         :param v1_pass_threshold: 预筛选通过率低于此值视为差
         """
-        result = []
-        for term in self.terms:
-            if term.stats.total_tried < 10:  # 样本不足，暂不判断
-                continue
-            if term.stats.v2_pass_rate < v2_pass_threshold or \
-                    (term.stats.v1_pass_rate < v1_pass_threshold and term.stats.total_tried > 20):
-                result.append(term)
-        return result
+        with self._lock:
+            result = []
+            for term in self.terms:
+                if term.stats.total_tried < 10:  # 样本不足，暂不判断
+                    continue
+                if term.stats.v2_pass_rate < v2_pass_threshold or \
+                        (term.stats.v1_pass_rate < v1_pass_threshold and term.stats.total_tried > 20):
+                    result.append(term)
+            return result
 
     def get_category_counts(self) -> Dict[str, int]:
         """返回每个类别当前累计合格数量"""
-        counts = {}
-        for term in self.terms:
-            counts[term.category] = counts.get(term.category, 0) + term.stats.total_qualified
-        return counts
+        with self._lock:
+            counts = {}
+            for term in self.terms:
+                counts[term.category] = counts.get(term.category, 0) + term.stats.total_qualified
+            return counts
 
     def to_dict(self) -> dict:
         """序列化，用于保存状态"""
-        return {
-            "terms": [
-                {
-                    "text": t.text,
-                    "category": t.category,
-                    "weight": t.weight,
-                    "stats": {
-                        "v1_pass_rate": t.stats.v1_pass_rate,
-                        "v2_pass_rate": t.stats.v2_pass_rate,
-                        "total_tried": t.stats.total_tried,
-                        "total_downloaded": t.stats.total_downloaded,
-                        "total_qualified": t.stats.total_qualified,
-                        "failure_reasons": t.stats.failure_reasons
-                    },
-                    "original_text": t.original_text,
-                    "generation_round": t.generation_round
-                }
-                for t in self.terms
-            ],
-            "target_dist": self.target_dist,
-            "min_weight": self.min_weight,
-            "weight_decay_factor": self.weight_decay_factor
-        }
+        with self._lock:
+            return {
+                "terms": [
+                    {
+                        "text": t.text,
+                        "category": t.category,
+                        "weight": t.weight,
+                        "stats": {
+                            "v1_pass_rate": t.stats.v1_pass_rate,
+                            "v2_pass_rate": t.stats.v2_pass_rate,
+                            "total_tried": t.stats.total_tried,
+                            "total_downloaded": t.stats.total_downloaded,
+                            "total_qualified": t.stats.total_qualified,
+                            "failure_reasons": t.stats.failure_reasons
+                        },
+                        "original_text": t.original_text,
+                        "generation_round": t.generation_round
+                    }
+                    for t in self.terms
+                ],
+                "target_dist": self.target_dist,
+                "min_weight": self.min_weight,
+                "weight_decay_factor": self.weight_decay_factor
+            }
 
     @classmethod
     def from_dict(cls, data: dict) -> "SearchTermPool":

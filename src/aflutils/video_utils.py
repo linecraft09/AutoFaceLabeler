@@ -1,6 +1,8 @@
 import os
+import shutil
 import subprocess
 import tempfile
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional
 
@@ -8,11 +10,35 @@ import cv2
 
 from aflutils.logger import get_logger
 
-FFPROBE = 'D:/Softwares/ffmpeg/ffmpeg-8.0-essentials_build/bin/ffprobe'
+def _find_ffmpeg() -> str:
+    """Find ffmpeg binary: check PATH first, fall back to Windows hardcoded path."""
+    path = shutil.which('ffmpeg')
+    if path:
+        return path
+    # Fallback for Windows compatibility
+    return "D:/Softwares/ffmpeg/ffmpeg-master-latest-win64-gpl-shared/bin/ffmpeg"
 
-FFMPEG = "D:/Softwares/ffmpeg/ffmpeg-master-latest-win64-gpl-shared/bin/ffmpeg"
+def _find_ffprobe() -> str:
+    """Find ffprobe binary: check PATH first, fall back to Windows hardcoded path."""
+    path = shutil.which('ffprobe')
+    if path:
+        return path
+    # Fallback for Windows compatibility
+    return 'D:/Softwares/ffmpeg/ffmpeg-8.0-essentials_build/bin/ffprobe'
+
+FFMPEG = _find_ffmpeg()
+FFPROBE = _find_ffprobe()
 
 logger = get_logger(__name__)
+
+
+def _check_ffmpeg_cuda_support() -> bool:
+    """Check if the ffmpeg binary supports CUDA/NVENC."""
+    try:
+        result = subprocess.run([FFMPEG, "-encoders"], capture_output=True, text=True, timeout=10)
+        return 'nvenc' in result.stdout or 'cuda' in result.stdout
+    except Exception:
+        return False
 
 
 def sample_video_per_sec(input_path: str, suffix: str = "_sample", output_ext: str = ".mp4") -> str:
@@ -39,27 +65,39 @@ def sample_video_per_sec(input_path: str, suffix: str = "_sample", output_ext: s
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     output_path = os.path.join(base_dir, f"{base_name}{suffix}{output_ext}")
 
-    # 构建 ffmpeg 命令：
-    cmd = [
-        FFMPEG, "-y",
-        "-hwaccel", "cuda",
-        "-i", input_path,
-        "-vf", "fps=1",
-        "-an",
-        "-c:v", "h264_nvenc",  # 硬件编码
-        "-preset", "p1",  # 速度优先
-        "-cq", "23",
-        output_path
-    ]
-
     try:
         # 检查 ffmpeg 是否可用
-        subprocess.run([FFMPEG, "-version"], capture_output=True, check=True)
+        subprocess.run([FFMPEG, "-version"], capture_output=True, check=True, timeout=10)
     except (subprocess.SubprocessError, FileNotFoundError):
         raise FileNotFoundError("未找到 ffmpeg，请确保已安装并加入 PATH")
 
+    # Detect CUDA support
+    has_cuda = _check_ffmpeg_cuda_support()
+
+    # 构建 ffmpeg 命令
+    if has_cuda:
+        cmd = [
+            FFMPEG, "-y",
+            "-hwaccel", "cuda",
+            "-i", input_path,
+            "-vf", "fps=1",
+            "-an",
+            "-c:v", "h264_nvenc",
+            "-preset", "p1",
+            "-cq", "23",
+            output_path
+        ]
+    else:
+        cmd = [
+            FFMPEG, "-y",
+            "-i", input_path,
+            "-vf", "fps=1",
+            "-an",
+            output_path
+        ]
+
     # 执行抽取和合并
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg 执行失败 (返回码 {result.returncode}):\n{result.stderr}")
 
@@ -89,6 +127,9 @@ def get_video_secs(video_path: str) -> float:
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
+    if fps is None or not math.isfinite(fps) or fps <= 0:
+        logger.warning(f"Invalid FPS ({fps}) for {video_path}, returning 0.0 seconds")
+        return 0.0
     return total_frames / fps
 
 
