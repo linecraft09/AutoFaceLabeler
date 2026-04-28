@@ -2,6 +2,7 @@ import math
 from typing import Tuple, List, Generator
 
 import cv2
+import numpy as np
 from ultralytics import YOLO
 
 import aflutils.video_utils as VU
@@ -182,3 +183,24 @@ class YOLODetector:
                 num_person = cls_ids.count(0)  # COCO class 0 = person
             counts.append(num_person)
         return counts
+
+    def detect_person_boxes(self, frame: np.ndarray, conf_threshold: float = 0.5) -> List[np.ndarray]:
+        """Detect person boxes in a single frame, returns [x1, y1, x2, y2] boxes."""
+        results = self.model(
+            frame,
+            conf=conf_threshold,
+            verbose=False,
+            device=self.device
+        )
+        if not results:
+            return []
+        result = results[0]
+        if result.boxes is None:
+            return []
+        cls_ids = result.boxes.cls.int().tolist()
+        xyxy = result.boxes.xyxy.cpu().numpy()
+        boxes = []
+        for i, cls_id in enumerate(cls_ids):
+            if cls_id == 0:  # COCO person
+                boxes.append(xyxy[i][:4].astype(int))
+        return boxes

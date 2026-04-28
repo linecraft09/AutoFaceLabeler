@@ -1,4 +1,4 @@
-# src/utils/models.py
+# src/core/models/video_meta.py
 from dataclasses import dataclass
 from typing import List, Dict
 

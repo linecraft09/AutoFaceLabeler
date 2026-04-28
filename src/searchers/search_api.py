@@ -1,4 +1,4 @@
-# src/searcher/base.py
+# src/searchers/search_api.py
 from abc import ABC, abstractmethod
 from typing import List
 

@@ -1,4 +1,4 @@
-# src/explorer/search_term_pool.py
+# src/explorers/search_term_pool.py
 import threading
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional

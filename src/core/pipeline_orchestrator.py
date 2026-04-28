@@ -6,7 +6,7 @@ import aflutils.video_utils as VU
 from aflutils.config_loader import ConfigLoader
 from aflutils.logger import get_logger
 from core.storage.video_store import VideoStore
-from downloaders.base_downloader import BaseDownloader
+from downloaders.base_downloader import DefaultDownloader
 from explorers.adaptive_scheduler import AdaptiveScheduler
 from searchers.ytdlp_search_api import YtDlpSearchApi
 from validators.pre_filter import PreFilter
@@ -38,7 +38,7 @@ def run_pipeline(config=None):
     explorer = AdaptiveScheduler(config.get('explorer', {}))
     v1 = PreFilter(config.get('validator1', {}))
     project_root = Path(__file__).resolve().parent.parent.parent
-    downloader = BaseDownloader(config_path=str(project_root / "config/download_conf.yaml"))
+    downloader = DefaultDownloader(config_path=str(project_root / "config/download_conf.yaml"))
 
     # 初始化视频存储
     video_store = VideoStore(db_path=str(project_root / "data/videos.db"))

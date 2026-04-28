@@ -1,5 +1,6 @@
 import os
 import atexit
+from typing import Any, Optional, Sequence, Tuple
 
 import faiss
 import numpy as np
@@ -80,7 +81,50 @@ class ArcFaceEmbedder:
             # Avoid destructor-time hard failures.
             pass
 
-    def extract(self, face_img: np.ndarray):
+    @staticmethod
+    def _normalize_box(box: Any, frame_shape: Tuple[int, int, int]) -> Optional[np.ndarray]:
+        """
+        Normalize an external face box into [x1, y1, x2, y2] int ndarray in frame bounds.
+        """
+        if box is None:
+            return None
+        if hasattr(box, "bbox"):
+            box = box.bbox
+        arr = np.asarray(box).reshape(-1)
+        if arr.shape[0] < 4:
+            return None
+        x1, y1, x2, y2 = arr[:4].astype(int)
+        h, w = frame_shape[:2]
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(0, min(x2, w))
+        y2 = max(0, min(y2, h))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return np.array([x1, y1, x2, y2], dtype=int)
+
+    def extract(self, face_img: np.ndarray, face_boxes: Optional[Sequence[Any]] = None):
+        """
+        Extract a face embedding result.
+        If face_boxes is provided, skips full-frame face detection and runs ArcFace on cropped boxes.
+        """
+        if face_boxes:
+            for box in face_boxes:
+                bbox = self._normalize_box(box, face_img.shape)
+                if bbox is None:
+                    continue
+                x1, y1, x2, y2 = bbox.tolist()
+                crop = face_img[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
+                faces = self.face_app.get(crop, max_num=1)
+                if len(faces) == 0:
+                    continue
+                face = faces[0]
+                face.bbox = bbox.astype(np.float32)
+                return face
+            return None
+
         faces = self.face_app.get(face_img, max_num=1)
         if len(faces) == 0:
             return None

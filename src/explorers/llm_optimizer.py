@@ -1,4 +1,4 @@
-# src/explorer/llm_optimizer.py
+# src/explorers/llm_optimizer.py
 import os
 from pathlib import Path
 from typing import List, Dict, Optional
