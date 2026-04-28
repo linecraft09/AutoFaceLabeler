@@ -40,8 +40,11 @@ class AdaptiveScheduler:
         self.v1_optimization_threshold = llm_cfg.get('optimization_trigger_v1_pass_rate', 0.1)
 
         # 全局目标合格数量
-        self.target_qualified = config.get('orchestrator', {}).get('target_qualified', 200)
-        self.json_file = config.get('json_file', "D:/WorkDir/AutoFaceLabeler/data/explorer.json")
+        self.target_qualified = config.get('pipeline', {}).get('target_qualified', 200)
+        self.json_file = config.get('project', {}).get('explorer_state', "./data/explorer.json")
+        self.new_term_weight = llm_cfg.get('new_term_weight', 0.5)
+        self.variant_weight_ratio = llm_cfg.get('variant_weight_ratio', 0.6)
+        self.low_perf_weight_ratio = llm_cfg.get('low_perf_weight_ratio', 0.3)
         self.load_state(self.json_file)
 
     def generate_batch(self, batch_size: int = 20) -> List[SearchTerm]:
@@ -109,7 +112,7 @@ class AdaptiveScheduler:
                     self.pool.add_term(
                         text=term,
                         category=cat,
-                        weight=0.5,  # 初始权重为中等
+                        weight=self.new_term_weight,  # 初始权重为中等
                         original_text=None,
                         generation_round=1
                     )
@@ -135,12 +138,12 @@ class AdaptiveScheduler:
                     self.pool.add_term(
                         text=var,
                         category=term.category,
-                        weight=term.weight * 0.6,  # 新词继承部分权重
+                        weight=term.weight * self.variant_weight_ratio,  # 新词继承部分权重
                         original_text=term.text,
                         generation_round=term.generation_round + 1
                     )
                 # 降低原词权重，避免继续大量使用
-                self.pool.set_weight(term.text, term.weight * 0.3)
+                self.pool.set_weight(term.text, term.weight * self.low_perf_weight_ratio)
 
     def should_stop(self) -> bool:
         """检查是否已达到目标数量"""

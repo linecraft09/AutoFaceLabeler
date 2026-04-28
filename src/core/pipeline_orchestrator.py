@@ -35,18 +35,22 @@ def _is_transient_error(exc: Exception) -> bool:
 def run_pipeline(config=None):
     if config is None:
         config = ConfigLoader("./config/config.yaml")
-    explorer = AdaptiveScheduler(config.get('explorer', {}))
-    v1 = PreFilter(config.get('validator1', {}))
+    explorer_cfg = config.get('explorer', {})
+    explorer_cfg['pipeline'] = config.get('pipeline', {})
+    explorer_cfg['project'] = config.get('project', {})
+    explorer = AdaptiveScheduler(explorer_cfg)
+    v1 = PreFilter(config.get('v1_filter', {}))
     project_root = Path(__file__).resolve().parent.parent.parent
-    downloader = DefaultDownloader(config_path=str(project_root / "config/download_conf.yaml"))
+    downloader = DefaultDownloader(config_dict=config.get('download', {}))
 
     # 初始化视频存储
-    video_store = VideoStore(db_path=str(project_root / "data/videos.db"))
-    yt_searcher = YtDlpSearchApi(platform='youtube', video_store=video_store)
-    bl_searcher = YtDlpSearchApi(platform='bilibili', video_store=video_store)
+    video_store = VideoStore(db_path=config.get('project', {}).get('video_db', './data/videos.db'))
+    search_cfg = config.get('search', {})
+    yt_searcher = YtDlpSearchApi(platform='youtube', video_store=video_store, search_config=search_cfg)
+    bl_searcher = YtDlpSearchApi(platform='bilibili', video_store=video_store, search_config=search_cfg)
 
     # 初始化并启动 V2 后台线程
-    v2_config = config.get('validator2', {})
+    v2_config = config.get('v2_filter', {})
     v2_filter = V2ContentFilter(v2_config, video_store, explorer)
     v2_filter.start()
     loop_retry_attempt = 0
@@ -56,18 +60,22 @@ def run_pipeline(config=None):
             try:
                 stats = video_store.get_statistics()
                 logger.info(f"Storage stats: {stats}")
-                while sum(stats.values()) > 0 and stats.get("downloaded", 0) / sum(stats.values()) >= 0.5:
+                pipeline_cfg = config.get('pipeline', {})
+                pending_ratio_threshold = pipeline_cfg.get('pending_ratio_threshold', 0.5)
+                pending_wait_seconds = pipeline_cfg.get('pending_wait_seconds', 60)
+                while sum(stats.values()) > 0 and stats.get("downloaded", 0) / sum(stats.values()) >= pending_ratio_threshold:
                     logger.warning(f"downloaded videos so many, wait to be consumed.")
-                    time.sleep(60)
+                    time.sleep(pending_wait_seconds)
                     stats = video_store.get_statistics()
-                batch = explorer.generate_batch(batch_size=10)
+                batch = explorer.generate_batch(batch_size=pipeline_cfg.get('batch_size', 10))
                 for term in batch:
-                    max_retries = 3
+                    max_retries = pipeline_cfg.get('max_retries', 3)
                     for attempt in range(max_retries + 1):
                         try:
                             # 搜索
-                            videos = yt_searcher.search(term.text, max_results=30)
-                            videos.extend(bl_searcher.search(term.text, max_results=30))
+                            max_results = search_cfg.get('per_platform_results', 20)
+                            videos = yt_searcher.search(term.text, max_results=max_results)
+                            videos.extend(bl_searcher.search(term.text, max_results=max_results))
 
                             # V1 预筛选
                             passed, feedback_v1 = v1.filter(videos, term.text)
@@ -107,7 +115,7 @@ def run_pipeline(config=None):
                                 exc_info=True
                             )
                             break
-                if stats.get("v2_passed", 0) >= config.get("orchestrator", {}).get("target_qualified", 200):
+                if stats.get("v2_passed", 0) >= config.get("pipeline", {}).get("target_qualified", 200):
                     break
 
                 # 每轮后自适应

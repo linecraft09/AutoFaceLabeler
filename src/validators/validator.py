@@ -27,28 +27,31 @@ class V2ContentFilter:
         self.stop_event = threading.Event()
         self.thread = None
 
-        yolo_cfg = config.get('coarse_filter', {})
+        yolo_cfg = config.get('coarse', {})
         self.yolo = YOLODetector(
             model_path=yolo_cfg.get('model_path', 'yolov8n.pt'),
-            device=yolo_cfg.get('device', 'cpu')
+            device=config.get('device', 'cpu'),
+            batch_size=yolo_cfg.get('batch_size', 16),
         )
 
         self.single_person_threshold = yolo_cfg.get('single_person_threshold', 0.8)
         self.audio_required = yolo_cfg.get('audio_required', True)
 
-        fine_cfg = config.get('fine_filter', {})
-        self.max_head_angle = fine_cfg.get('head_pose_max_angle', 10)
-        self.head_pose_required_ratio = fine_cfg.get('head_pose_required_ratio', 0.8)
-        self.laplacian_threshold = fine_cfg.get('laplacian_threshold', 100)
-        self.laplacian_required_ratio = fine_cfg.get('laplacian_required_ratio', 0.8)
+        fine_cfg = config.get('fine', {})
+        head_pose_cfg = fine_cfg.get('head_pose', {})
+        laplacian_cfg = fine_cfg.get('laplacian', {})
+        self.max_head_angle = head_pose_cfg.get('max_angle', 10)
+        self.head_pose_required_ratio = head_pose_cfg.get('required_ratio', 0.8)
+        self.laplacian_threshold = laplacian_cfg.get('threshold', 100)
+        self.laplacian_required_ratio = laplacian_cfg.get('required_ratio', 0.8)
         self.dedup_threshold = fine_cfg.get('dedup_threshold', 0.7)
 
         self.known_embeddings = []
-        self.max_head_angle = fine_cfg.get('head_pose_max_angle', 10)
-        self.head_pose_required_ratio = fine_cfg.get('head_pose_required_ratio', 0.8)
-        self.laplacian_threshold = fine_cfg.get('laplacian_threshold', 100)
+        self.max_head_angle = head_pose_cfg.get('max_angle', 10)
+        self.head_pose_required_ratio = head_pose_cfg.get('required_ratio', 0.8)
+        self.laplacian_threshold = laplacian_cfg.get('threshold', 100)
 
-        device = fine_cfg.get('device', 'cpu')
+        device = config.get('device', 'cpu')
         # ArcFace
         self.face_embedder = ArcFaceEmbedder(
             device=device,
@@ -95,9 +98,9 @@ class V2ContentFilter:
 
     def _run_loop(self):
         while not self.stop_event.is_set():
-            pending = self.store.get_pending_videos(limit=5)
+            pending = self.store.get_pending_videos(limit=self.config.get('pending_limit', 5))
             if not pending:
-                time.sleep(5)
+                time.sleep(self.config.get('poll_interval_seconds', 5))
                 continue
 
             for video_row in pending:
@@ -244,9 +247,10 @@ class V2ContentFilter:
         norm_poses = normalize_values(poses)
 
         score_map = {}
-        w_duration = 0.45
-        w_clarity = 0.35
-        w_pose = 0.20
+        ranking_cfg = self.config.get('fine', {}).get('ranking', {})
+        w_duration = ranking_cfg.get('weight_duration', 0.45)
+        w_clarity = ranking_cfg.get('weight_clarity', 0.35)
+        w_pose = ranking_cfg.get('weight_pose', 0.20)
         for idx, candidate in enumerate(passed_candidates):
             score_map[candidate[0]] = (
                     w_duration * norm_durations[idx]
@@ -273,7 +277,7 @@ class V2ContentFilter:
 
         best_video_path, best_pose, best_clarity, best_embedding, best_duration = passed_videos[0]
 
-        target_duration = 30.0
+        target_duration = ranking_cfg.get('target_clip_duration', 30.0)
         video_duration = best_duration
         if video_duration >= target_duration:
             self.face_embedder.add_embedding(best_embedding)
@@ -306,7 +310,10 @@ class V2ContentFilter:
             if total_frames == 0:
                 return video_path, False, None, 'no_frames'
 
-            sample_count = max(1, min(200, int(total_frames * 0.1)))
+            sampling_cfg = self.config.get('fine', {}).get('sampling', {})
+            sample_max = sampling_cfg.get('max_frames', 200)
+            sample_rate = sampling_cfg.get('rate', 0.1)
+            sample_count = max(1, min(sample_max, int(total_frames * sample_rate)))
             sample_indices = np.linspace(0, total_frames - 1, sample_count, dtype=int)
             sample_indices_set = set(int(i) for i in sample_indices.tolist())
             sample_count = len(sample_indices_set)

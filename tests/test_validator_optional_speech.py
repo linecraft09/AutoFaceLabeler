@@ -34,8 +34,8 @@ class TestValidatorOptionalSpeech(unittest.TestCase):
             mock_yolo.return_value = object()
             mock_arc.return_value = object()
             cfg = {
-                'coarse_filter': {'device': 'cpu', 'model_path': 'yolo11n.pt'},
-                'fine_filter': {'device': 'cpu', 'speech_required': False},
+                'coarse': {'device': 'cpu', 'model_path': 'yolo11n.pt'},
+                'fine': {'device': 'cpu', 'speech_required': False},
             }
             filt = V2ContentFilter(cfg, store)
             self.assertFalse(hasattr(filt, 'speaker_detector'))

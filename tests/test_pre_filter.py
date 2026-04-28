@@ -45,14 +45,12 @@ def make_video(
 class TestPreFilter(unittest.TestCase):
     def test_filter_returns_expected_result_with_mixed_conditions(self):
         config = {
-            "filters": {
-                "min_duration": 60,
-                "max_duration": 600,
-                "min_resolution": 720,
-                "title_blacklist": [r"shorts", r"trailer"],
-                "channel_blacklist": [r"spam_channel"],
-                "min_views": 1000,
-            }
+            "min_duration": 60,
+            "max_duration": 600,
+            "min_resolution": 720,
+            "title_blacklist": [r"shorts", r"trailer"],
+            "channel_blacklist": [r"spam_channel"],
+            "min_views": 1000,
         }
         pre_filter = PreFilter(config)
 
@@ -91,12 +89,10 @@ class TestPreFilter(unittest.TestCase):
     def test_duration_filter_independent(self):
         pre_filter = PreFilter(
             {
-                "filters": {
-                    "min_duration": 60,
-                    "max_duration": 600,
-                    "min_resolution": 1,
-                    "min_views": 0,
-                }
+                "min_duration": 60,
+                "max_duration": 600,
+                "min_resolution": 1,
+                "min_views": 0,
             }
         )
         videos = [make_video("ok"), make_video("bad", duration_seconds=30)]
@@ -111,12 +107,10 @@ class TestPreFilter(unittest.TestCase):
     def test_resolution_filter_independent(self):
         pre_filter = PreFilter(
             {
-                "filters": {
-                    "min_duration": 1,
-                    "max_duration": 10_000,
-                    "min_resolution": 720,
-                    "min_views": 0,
-                }
+                "min_duration": 1,
+                "max_duration": 10_000,
+                "min_resolution": 720,
+                "min_views": 0,
             }
         )
         videos = [make_video("ok", resolution="1080p"), make_video("bad", resolution="480p")]
@@ -131,13 +125,11 @@ class TestPreFilter(unittest.TestCase):
     def test_title_blacklist_filter_independent(self):
         pre_filter = PreFilter(
             {
-                "filters": {
-                    "min_duration": 1,
-                    "max_duration": 10_000,
-                    "min_resolution": 1,
-                    "title_blacklist": [r"forbidden"],
-                    "min_views": 0,
-                }
+                "min_duration": 1,
+                "max_duration": 10_000,
+                "min_resolution": 1,
+                "title_blacklist": [r"forbidden"],
+                "min_views": 0,
             }
         )
         videos = [make_video("ok", title="normal title"), make_video("bad", title="Forbidden content")]
@@ -153,13 +145,11 @@ class TestPreFilter(unittest.TestCase):
     def test_channel_blacklist_filter_independent(self):
         pre_filter = PreFilter(
             {
-                "filters": {
-                    "min_duration": 1,
-                    "max_duration": 10_000,
-                    "min_resolution": 1,
-                    "channel_blacklist": [r"blocked_channel"],
-                    "min_views": 0,
-                }
+                "min_duration": 1,
+                "max_duration": 10_000,
+                "min_resolution": 1,
+                "channel_blacklist": [r"blocked_channel"],
+                "min_views": 0,
             }
         )
         videos = [
@@ -178,12 +168,10 @@ class TestPreFilter(unittest.TestCase):
     def test_views_filter_independent(self):
         pre_filter = PreFilter(
             {
-                "filters": {
-                    "min_duration": 1,
-                    "max_duration": 10_000,
-                    "min_resolution": 1,
-                    "min_views": 1000,
-                }
+                "min_duration": 1,
+                "max_duration": 10_000,
+                "min_resolution": 1,
+                "min_views": 1000,
             }
         )
         videos = [make_video("ok", view_count=1000), make_video("bad", view_count=999)]

@@ -53,14 +53,14 @@ class ConfigLoader:
     def _validate_schema(self, config: Dict[str, Any]) -> None:
         """轻量级配置校验：检查关键路径类型与未知键。"""
         expected_schema: Dict[str, Any] = {
-            "orchestrator": {
+            "pipeline": {
                 "target_qualified": int,
             },
-            "validator2": {
-                "coarse_filter": {
+            "v2_filter": {
+                "coarse": {
                     "model_path": str,
                 },
-                "fine_filter": {
+                "fine": {
                     "face_db_path": str,
                 },
                 "qualified_dir": str,
@@ -105,7 +105,7 @@ class ConfigLoader:
                 _warn_unexpected(value, schema_node[key], key_path)
 
         _validate_required(config, expected_schema)
-        for scoped_key in ("orchestrator", "validator2"):
+        for scoped_key in ("pipeline", "v2_filter"):
             if scoped_key in config and scoped_key in expected_schema:
                 _warn_unexpected(config[scoped_key], expected_schema[scoped_key], scoped_key)
 
