@@ -3,6 +3,7 @@ from typing import Tuple, List, Generator
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 import aflutils.video_utils as VU
@@ -15,12 +16,18 @@ class YOLODetector:
     """YOLOv8 用于单人检测（支持 GPU 加速 + 流式推理）"""
 
     def __init__(self, model_path: str = 'yolov8n.pt', device: str = 'cpu', batch_size: int = 16):
-        self.device = device
+        requested_device = (device or 'cpu').lower()
+        self.device = 'cuda' if requested_device == 'cuda' else 'cpu'
         self.batch_size = max(1, int(batch_size))
         self.model = YOLO(model_path)
-        if device == 'cuda':
-            self.model.to('cuda')
-            logger.info("YOLO model loaded on GPU")
+        if self.device == 'cuda':
+            if torch.cuda.is_available():
+                self.model.to('cuda')
+                logger.info("YOLO model loaded on GPU")
+            else:
+                self.device = 'cpu'
+                logger.warning("CUDA requested for YOLO but unavailable; falling back to CPU")
+                logger.info("YOLO model loaded on CPU")
         else:
             logger.info("YOLO model loaded on CPU")
 

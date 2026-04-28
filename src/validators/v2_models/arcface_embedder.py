@@ -4,6 +4,7 @@ from typing import Any, Optional, Sequence, Tuple
 
 import faiss
 import numpy as np
+import torch
 from insightface.app import FaceAnalysis
 
 from aflutils.logger import get_logger
@@ -15,12 +16,15 @@ class ArcFaceEmbedder:
     """ArcFace 人脸特征提取与向量库去重"""
 
     def __init__(self, model_name: str = 'buffalo_m', device: str = 'cpu', db_path: str = 'data/face_index.faiss'):
-        self.device = device
+        requested_device = (device or 'cpu').lower()
+        self.device = 'cuda' if requested_device == 'cuda' and torch.cuda.is_available() else 'cpu'
+        if requested_device == 'cuda' and self.device != 'cuda':
+            logger.warning("CUDA requested for ArcFace but unavailable; falling back to CPU")
         self.db_path = db_path
         # 初始化 FaceAnalysis
-        providers = ['CUDAExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+        providers = ['CUDAExecutionProvider'] if self.device == 'cuda' else ['CPUExecutionProvider']
         self.face_app = FaceAnalysis(name=model_name, providers=providers)
-        self.face_app.prepare(ctx_id=0 if device == 'cuda' else -1, det_thresh=0.65, det_size=(320, 320))
+        self.face_app.prepare(ctx_id=0 if self.device == 'cuda' else -1, det_thresh=0.65, det_size=(320, 320))
 
         # FAISS 索引维度
         self.dim = 512

@@ -13,7 +13,6 @@ from aflutils.logger import get_logger
 from core.storage.video_store import VideoStore
 from .v2_models.arcface_embedder import ArcFaceEmbedder
 from .v2_models.face_quality import compute_laplacian_variance
-from .v2_models.speaker_detector import SpeakerDetector
 from .v2_models.yolo_detector import YOLODetector
 
 logger = get_logger(__name__)
@@ -58,6 +57,7 @@ class V2ContentFilter:
 
         self.speech_required = fine_cfg.get('speech_required', False)
         if self.speech_required:
+            from .v2_models.speaker_detector import SpeakerDetector
             self.speaker_detector = SpeakerDetector()
 
         self.feedback = {
