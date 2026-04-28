@@ -57,7 +57,7 @@ explorer:
       review: 0.15
     min_weight: 0.1
     weight_decay_factor: 0.9       # 每次反馈后未使用的词权重衰减
-  json_file: "D:/WorkDir/AutoFaceLabeler/data/explorer.json"
+  json_file: "./data/explorer.json"
 orchestrator:
   target_qualified: 200
 
@@ -85,6 +85,6 @@ validator2:
     pose_model: '6drepnet'
     device: 'cuda'
     speech_required: true          # 是否检测人声
-    face_db_path: 'D:/WorkDir/AutoFaceLabeler/data/face_index.faiss'
-  qualified_dir: 'E:/WorkDir/videodata/data/qualified'
+    face_db_path: './data/face_index.faiss'
+  qualified_dir: './data/qualified'
 

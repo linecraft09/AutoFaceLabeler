@@ -20,8 +20,8 @@ class SpeakerDetector:
         self.device = device
         self.vad_pipeline = pipeline(
             task=Tasks.voice_activity_detection,
-            model="C:/Users/linecraft/.cache/modelscope/hub/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
-            local_files_only=True
+            model="iic/speech_fsmn_vad_zh-cn-16k-common-pytorch",
+            local_files_only=False
         )
 
     def detect_speech(self, audio_path: str) -> bool:

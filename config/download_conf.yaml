@@ -34,7 +34,7 @@ user_agent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML
 
 # ---------- Output & File Management ----------
 # Output template: create subfolders by site and uploader
-outtmpl: 'E:/WorkDir/videodata/data/raw/%(id)s/%(title)s [%(id)s].%(ext)s'
+outtmpl: './data/raw/%(id)s/%(title)s [%(id)s].%(ext)s'
 
 # Write video metadata as JSON (for future extension)
 writeinfojson: True
@@ -75,4 +75,4 @@ playlistend: 999999                      # Download all items in playlist/channe
 #   Referer: 'https://www.bilibili.com/'
 
 # Path to custom ffmpeg binary (if not in PATH)
-ffmpeg_location: 'D:/Softwares/ffmpeg/ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe'
+# ffmpeg_location: '/usr/bin/ffmpeg'  # 默认使用 PATH 中的 ffmpeg
