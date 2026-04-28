@@ -1,4 +1,5 @@
 import os
+import atexit
 
 import faiss
 import numpy as np
@@ -23,7 +24,10 @@ class ArcFaceEmbedder:
         # FAISS 索引维度
         self.dim = 512
         self.index = None
+        self._last_saved_ntotal = 0
+        self._flush_lock = False
         self._load_index()
+        atexit.register(self.flush)
 
     def _load_index(self):
         if os.path.exists(self.db_path):
@@ -32,10 +36,28 @@ class ArcFaceEmbedder:
         else:
             self.index = faiss.IndexFlatL2(self.dim)
             logger.info("Created new FAISS index")
+        self._last_saved_ntotal = self.index.ntotal
 
     def _save_index(self):
         faiss.write_index(self.index, self.db_path)
+        self._last_saved_ntotal = self.index.ntotal
         logger.info(f"Saved FAISS index to {self.db_path}, size={self.index.ntotal}")
+
+    def flush(self):
+        """写回未持久化的向量，确保增量写入不会在异常退出时丢失。"""
+        if self.index is None:
+            return
+        if self._flush_lock:
+            return
+        if self.index.ntotal == self._last_saved_ntotal:
+            return
+        try:
+            self._flush_lock = True
+            self._save_index()
+        except Exception as e:
+            logger.error(f"Failed to flush FAISS index: {e}", exc_info=True)
+        finally:
+            self._flush_lock = False
 
     def is_duplicate(self, embedding: np.ndarray, threshold: float = 0.8) -> bool:
         """检查是否重复（L2距离阈值，归一化特征下0.8对应余弦相似度约0.68）"""
@@ -50,6 +72,13 @@ class ArcFaceEmbedder:
         self.index.add(embedding.reshape(1, -1))
         if self.index.ntotal % 10 == 0:
             self._save_index()
+
+    def __del__(self):
+        try:
+            self.flush()
+        except Exception:
+            # Avoid destructor-time hard failures.
+            pass
 
     def extract(self, face_img: np.ndarray):
         faces = self.face_app.get(face_img, max_num=1)

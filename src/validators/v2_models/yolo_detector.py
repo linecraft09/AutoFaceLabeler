@@ -13,8 +13,9 @@ logger = get_logger(__name__)
 class YOLODetector:
     """YOLOv8 用于单人检测（支持 GPU 加速 + 流式推理）"""
 
-    def __init__(self, model_path: str = 'yolov8n.pt', device: str = 'cpu'):
+    def __init__(self, model_path: str = 'yolov8n.pt', device: str = 'cpu', batch_size: int = 16):
         self.device = device
+        self.batch_size = max(1, int(batch_size))
         self.model = YOLO(model_path)
         if device == 'cuda':
             self.model.to('cuda')
@@ -109,6 +110,13 @@ class YOLODetector:
             segments = []
             start_sec = None
 
+            pending_seconds = []
+            pending_frames = []
+
+            def _flush_pending():
+                counts = self._count_person_batch(pending_frames, conf_threshold)
+                return list(zip(pending_seconds, counts))
+
             for s in range(total_seconds):
                 # 跳转到第 s 秒的第一帧
                 frame_index = int(s * fps)  # 第 s 秒起始帧索引
@@ -118,22 +126,30 @@ class YOLODetector:
                     # 若跳转后读取失败，可能视频结束，跳出循环
                     break
 
-                # 推理
-                # logger.info(f"对于{video_path}，yolo正在推理第{s}/{total_seconds}秒的帧")
-                results = self.model(frame, conf=conf_threshold, verbose=True)
-                num_person = 0
-                if results[0].boxes is not None:
-                    cls_ids = results[0].boxes.cls.int().tolist()
-                    num_person = cls_ids.count(0)  # COCO class 0 = person
+                pending_seconds.append(s)
+                pending_frames.append(frame)
 
-                # 单人区间逻辑
-                if num_person == 1 and start_sec is None:
-                    start_sec = s
-                elif num_person != 1 and start_sec is not None:
-                    end_sec = s
-                    if end_sec > start_sec:
-                        segments.append((start_sec, end_sec))
-                    start_sec = None
+                if len(pending_frames) >= self.batch_size:
+                    for sec, num_person in _flush_pending():
+                        if num_person == 1 and start_sec is None:
+                            start_sec = sec
+                        elif num_person != 1 and start_sec is not None:
+                            end_sec = sec
+                            if end_sec > start_sec:
+                                segments.append((start_sec, end_sec))
+                            start_sec = None
+                    pending_seconds.clear()
+                    pending_frames.clear()
+
+            if pending_frames:
+                for sec, num_person in _flush_pending():
+                    if num_person == 1 and start_sec is None:
+                        start_sec = sec
+                    elif num_person != 1 and start_sec is not None:
+                        end_sec = sec
+                        if end_sec > start_sec:
+                            segments.append((start_sec, end_sec))
+                        start_sec = None
 
             # 处理视频结尾仍在单人区间的情况
             if start_sec is not None:
@@ -146,3 +162,23 @@ class YOLODetector:
 
         finally:
             cap.release()
+
+    def _count_person_batch(self, frames: List, conf_threshold: float) -> List[int]:
+        """对一批帧做一次推理并返回每帧人数。"""
+        if not frames:
+            return []
+
+        results = self.model(
+            frames,
+            conf=conf_threshold,
+            verbose=True,
+            device=self.device
+        )
+        counts = []
+        for result in results:
+            num_person = 0
+            if result.boxes is not None:
+                cls_ids = result.boxes.cls.int().tolist()
+                num_person = cls_ids.count(0)  # COCO class 0 = person
+            counts.append(num_person)
+        return counts

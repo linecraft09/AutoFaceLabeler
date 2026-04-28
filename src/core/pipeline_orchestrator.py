@@ -144,7 +144,15 @@ def run_pipeline(config=None):
                 loop_retry_attempt = 0
                 continue
     finally:
-        v2_filter.stop()
+        try:
+            v2_filter.stop()
+        finally:
+            thread = getattr(v2_filter, "thread", None)
+            if thread and thread.is_alive():
+                logger.error("V2 filter thread still alive after stop(); waiting up to 5s")
+                thread.join(timeout=5)
+                if thread.is_alive():
+                    logger.error("V2 filter thread still alive after timeout; leaving daemon thread to exit with process")
         explorer.save_state()
 
     # 循环结束后，可以启动过滤（或者单独运行）

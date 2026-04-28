@@ -1,9 +1,11 @@
 import random
 import copy
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
 import yt_dlp
+from yt_dlp.utils import DownloadError, ExtractorError
 
 from aflutils.logger import get_logger
 from core.models.video_meta import VideoMeta
@@ -11,6 +13,14 @@ from core.storage.video_store import VideoStore
 from .search_api import SearchApi
 
 logger = get_logger(__name__)
+
+
+class SearchRateLimitError(Exception):
+    pass
+
+
+class SearchNetworkError(Exception):
+    pass
 
 
 class YtDlpSearchApi(SearchApi):
@@ -85,9 +95,21 @@ class YtDlpSearchApi(SearchApi):
                 if not entries:
                     logger.warning(f"No entries found for query '{query}'")
                     return []
-            except Exception as e:
-                logger.error(f"Fast search failed for query '{query}': {e}")
+            except (DownloadError, ExtractorError) as e:
+                kind = self._classify_ytdlp_error(e)
+                if kind == "rate_limit":
+                    backoff = 5
+                    logger.error(f"Rate limited for query '{query}', backoff {backoff}s: {e}")
+                    time.sleep(backoff)
+                    raise SearchRateLimitError(str(e)) from e
+                if kind == "network":
+                    logger.error(f"Network failure for query '{query}': {e}")
+                    raise SearchNetworkError(str(e)) from e
+                logger.warning(f"No results or unsupported query '{query}': {e}")
                 return []
+            except Exception as e:
+                logger.error(f"Unexpected fast search failure for query '{query}': {e}", exc_info=True)
+                raise
         logger.info(f"Search for {query} on {self.platform} receive {len(entries)} video infos")
 
         # 快速扁平搜索结束后先去重：
@@ -181,9 +203,32 @@ class YtDlpSearchApi(SearchApi):
             try:
                 info = ydl.extract_info(url, download=False)
                 return info
-            except Exception as e:
-                logger.error(f"Failed to get details for {url}: {e}")
+            except (DownloadError, ExtractorError) as e:
+                kind = self._classify_ytdlp_error(e)
+                if kind == "network":
+                    logger.error(f"Network error while fetching details for {url}: {e}")
+                elif kind == "rate_limit":
+                    logger.error(f"Rate limit while fetching details for {url}: {e}")
+                else:
+                    logger.warning(f"No detail result for {url}: {e}")
                 return None
+            except Exception as e:
+                logger.error(f"Unexpected error getting details for {url}: {e}", exc_info=True)
+                return None
+
+    @staticmethod
+    def _classify_ytdlp_error(exc: Exception) -> str:
+        msg = str(exc).lower()
+        if any(k in msg for k in ("429", "too many requests", "rate limit", "ratelimit")):
+            return "rate_limit"
+        if any(k in msg for k in (
+                "timed out", "timeout", "connection", "network", "name resolution", "temporary failure",
+                "connection reset", "proxy error", "unreachable"
+        )):
+            return "network"
+        if any(k in msg for k in ("no results", "did not match any", "not found", "video unavailable")):
+            return "no_results"
+        return "other"
 
     @staticmethod
     def _extract_resolution_from_details(details: dict) -> str:
