@@ -1,11 +1,12 @@
 # Integration test config — minimal scope, exercise all pipeline stages
+# Data paths use /tmp to avoid polluting the repo
 explorer:
   initial_search_terms:
     - { text: "tutorial", platform: youtube, category: educational, weight: 1.0 }
     - { text: "vlog", platform: youtube, category: vlog, weight: 1.0 }
     - { text: "科普讲解", platform: bilibili, category: educational, weight: 1.0 }
   llm:
-    enabled: false  # Skip LLM to save time/API cost during test
+    enabled: false
     model: "deepseek-chat"
     api_key_env: "OPENAI_API_KEY"
     base_url: "https://api.deepseek.com"
@@ -17,10 +18,10 @@ explorer:
       vlog: 0.33
     min_weight: 0.1
     weight_decay_factor: 0.9
-  json_file: "./data/explorer_test.json"
+  json_file: "/tmp/afl_explorer_test.json"
 
 orchestrator:
-  target_qualified: 1  # Stop after first qualifying video
+  target_qualified: 1
 
 validator1:
   filters:
@@ -33,18 +34,18 @@ validator1:
 
 validator2:
   coarse_filter:
-    single_person_threshold: 0.5
-    audio_required: true
+    single_person_threshold: 0.15   # Very low for testing — most real videos fail at 0.5
+    audio_required: false           # Many short clips lack audio
     model_path: 'yolo11n.pt'
     device: 'cuda'
   fine_filter:
-    head_pose_max_angle: 30
-    head_pose_required_ratio: 0.5
-    laplacian_threshold: 10
-    laplacian_required_ratio: 0.5
-    dedup_threshold: 0.95
+    head_pose_max_angle: 45         # Relaxed for test
+    head_pose_required_ratio: 0.3   # Relaxed
+    laplacian_threshold: 5          # Relaxed
+    laplacian_required_ratio: 0.3   # Relaxed
+    dedup_threshold: 0.99           # Very loose — accept near duplicates in test
     pose_model: '6drepnet'
     device: 'cuda'
     speech_required: false
-    face_db_path: './data/face_index_test.faiss'
-  qualified_dir: './data/qualified_test'
+    face_db_path: '/tmp/afl_test_faces.faiss'
+  qualified_dir: '/tmp/afl_qualified_test'

@@ -67,3 +67,13 @@ cookies.txt
 __pycache__/
 *.pyc
 *.pyo
+
+# Test artifacts (reports, data, logs)
+TEST_REPORT*.md
+data/
+test_output/
+*.jsonl
+
+# OS artifacts  
+D:
+**/D:/

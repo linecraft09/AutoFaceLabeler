@@ -7,8 +7,8 @@ from pathlib import Path
 def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
-        # 确保日志目录存在（默认为当前目录下的 logs 文件夹）
-        log_dir = Path(__file__).resolve().parent.parent / "logs"
+        # 确保日志目录存在（项目根目录下的 logs 文件夹）
+        log_dir = Path(__file__).resolve().parent.parent.parent / "logs"
         os.makedirs(log_dir, exist_ok=True)
 
         # 使用 RotatingFileHandler 避免单文件过大

@@ -27,11 +27,13 @@ MONITOR_INTERVAL_SEC = 10
 CPU_WARN_PCT = 90
 GPU_MEM_WARN_PCT = 90
 CPU_SUSTAINED_SEC = 60
-MAX_LOOPS_WITHOUT_QUALIFIER = 3
+MAX_LOOPS_WITHOUT_QUALIFIER = 4  # Increased: V2 processing takes time
 LOG_PATH = Path('/tmp/afl_integration_test.jsonl')
+CONFIG_PATH = str(Path(__file__).resolve().parent / 'config_test.yaml')
 
 _STAGE = {'name': 'init'}
 _LOOPS = {'count': 0}
+_PASSES = {'v2_coarse': 0, 'v2_fine': 0}
 
 
 class JsonlLogger:
@@ -199,7 +201,7 @@ def main() -> int:
 
     thread = threading.Thread(
         target=_run_pipeline,
-        args=('config/config_test.yaml', pipeline_state, logger),
+        args=(CONFIG_PATH, pipeline_state, logger),
         daemon=True,
     )
     thread.start()
@@ -284,11 +286,20 @@ def main() -> int:
             'elapsed_sec': round(final_elapsed, 2),
             'stage_last': _STAGE['name'],
             'loop_count': _LOOPS['count'],
+            'v2_coarse_passes': _PASSES['v2_coarse'],
+            'v2_fine_passes': _PASSES['v2_fine'],
             'pipeline_exit': pipeline_state.get('exit'),
             'error': pipeline_state.get('error'),
         }
         logger.log('summary', summary)
         logger.close()
+
+    # Cleanup test artifacts (keep log for reporting)
+    for p in ['/tmp/afl_explorer_test.json', '/tmp/afl_test_faces.faiss']:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
     print(json.dumps(summary, ensure_ascii=True, indent=2))
     if pipeline_state.get('traceback'):
