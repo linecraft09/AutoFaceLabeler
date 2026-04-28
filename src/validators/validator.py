@@ -103,7 +103,17 @@ class V2ContentFilter:
             for video_row in pending:
                 if self.stop_event.is_set():
                     break
-                self._process_video(video_row)
+                try:
+                    self._process_video(video_row)
+                except Exception as e:
+                    logger.error(f"V2 filter failed on video {video_row.get('video_id', '?')}: {e}", exc_info=True)
+                    try:
+                        self.store.update_status(
+                            video_row['video_id'], video_row.get('platform', ''),
+                            'v2_failed', f'v2_exception: {e}'
+                        )
+                    except Exception as status_e:
+                        logger.error(f"Failed to update error status: {status_e}")
 
     def _process_video(self, video_row: Dict[str, Any]):
         video_id = video_row['video_id']
