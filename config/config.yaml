@@ -144,3 +144,8 @@ v2_filter:
       weight_clarity: 0.35
       weight_pose: 0.20
       target_clip_duration: 30.0
+    batch_size: 16
+    face_detection:
+      model_path: models/insightface/scrfd_320_batched/scrfd_10g_320_batch.onnx
+      det_thresh: 0.5
+      det_size: [320, 320]

@@ -116,6 +116,14 @@ class YtDlpSearchApi(SearchApi):
             except Exception as e:
                 logger.error(f"Unexpected fast search failure for query '{query}': {e}", exc_info=True)
                 raise
+            except BaseException as e:
+                if isinstance(e, SystemExit):
+                    logger.warning(
+                        f"yt-dlp exited during fast search for query '{query}' "
+                        f"(SystemExit code: {e.code!r})"
+                    )
+                    return []
+                raise
         logger.info(f"Search for {query} on {self.platform} receive {len(entries)} video infos")
 
         # 快速扁平搜索结束后先去重：
@@ -170,6 +178,15 @@ class YtDlpSearchApi(SearchApi):
                     except Exception as e:
                         logger.error(f"Failed to get details for {video_url}: {e}")
                         details_by_url[video_url] = None
+                    except BaseException as e:
+                        if isinstance(e, SystemExit):
+                            logger.warning(
+                                f"yt-dlp exited while fetching details for {video_url} "
+                                f"(SystemExit code: {e.code!r})"
+                            )
+                            details_by_url[video_url] = None
+                            continue
+                        raise
 
         for entry, video_url in entry_with_urls:
             # 获取详细信息
@@ -221,6 +238,14 @@ class YtDlpSearchApi(SearchApi):
             except Exception as e:
                 logger.error(f"Unexpected error getting details for {url}: {e}", exc_info=True)
                 return None
+            except BaseException as e:
+                if isinstance(e, SystemExit):
+                    logger.warning(
+                        f"yt-dlp exited while fetching details for {url} "
+                        f"(SystemExit code: {e.code!r})"
+                    )
+                    return None
+                raise
 
     @staticmethod
     def _classify_ytdlp_error(exc: Exception) -> str:

@@ -7,12 +7,15 @@ from typing import Tuple, Optional
 
 import cv2
 import numpy as np
+from insightface.utils import face_align
 
 import aflutils.video_utils as VU
 from aflutils.logger import get_logger
 from core.storage.video_store import VideoStore
 from .v2_models.arcface_embedder import ArcFaceEmbedder
 from .v2_models.face_quality import compute_laplacian_variance
+from .v2_models.landmark_batch import BatchLandmarkPose
+from .v2_models.scrfd_batch_detector import BatchSCRFDDetector, Detection
 from .v2_models.yolo_detector import YOLODetector
 
 logger = get_logger(__name__)
@@ -38,13 +41,19 @@ class V2ContentFilter:
         self.audio_required = yolo_cfg.get('audio_required', True)
 
         fine_cfg = config.get('fine', {})
+        self.fine_cfg = fine_cfg
         head_pose_cfg = fine_cfg.get('head_pose', {})
         laplacian_cfg = fine_cfg.get('laplacian', {})
+        face_cfg = fine_cfg.get('face', {})
         self.max_head_angle = head_pose_cfg.get('max_angle', 10)
         self.head_pose_required_ratio = head_pose_cfg.get('required_ratio', 0.8)
         self.laplacian_threshold = laplacian_cfg.get('threshold', 100)
         self.laplacian_required_ratio = laplacian_cfg.get('required_ratio', 0.8)
+        self.face_required_ratio = face_cfg.get('required_ratio', 0.8)
         self.dedup_threshold = fine_cfg.get('dedup_threshold', 0.7)
+        self.batch_size = int(fine_cfg.get('batch_size', 16))
+        self._batch_detector = None
+        self._landmark_pose = None
 
         self.known_embeddings = []
         self.max_head_angle = head_pose_cfg.get('max_angle', 10)
@@ -55,7 +64,8 @@ class V2ContentFilter:
         # ArcFace
         self.face_embedder = ArcFaceEmbedder(
             device=device,
-            db_path=fine_cfg.get('face_db_path', 'data/face_index.faiss')
+            db_path=fine_cfg.get('face_db_path', 'data/face_index.faiss'),
+            batch_size=self.batch_size,
         )
 
         self.speech_required = fine_cfg.get('speech_required', False)
@@ -70,6 +80,7 @@ class V2ContentFilter:
             'fail_reasons': {
                 'no_single_person': 0,
                 'no_audio': 0,
+                'no_face_detected': 0,
                 'head_pose_out_of_range': 0,
                 'blurry_face': 0,
                 'duplicate': 0,
@@ -195,7 +206,6 @@ class V2ContentFilter:
         results = []  # (video_path, success, data, fail_reason)
         # data is (pose_ratio, clarity_ratio, representative_embedding) or None
 
-        per_video_times = {}
         for video_path in video_paths:
             try:
                 result = self._process_single_video(video_path)
@@ -203,15 +213,6 @@ class V2ContentFilter:
             except Exception as e:
                 logger.error(f"fine filter single video {video_path} cause exception: {e}")
                 results.append((video_path, False, None, f"exception: {str(e)}"))
-
-        single_video_total = sum(per_video_times.values())
-        if per_video_times:
-            top_slowest = sorted(per_video_times.items(), key=lambda x: x[1], reverse=True)[:3]
-            logger.info(
-                f"fine_filter timing: processed {len(per_video_times)} clips, "
-                f"single_video_total={single_video_total:.3f}s, "
-                f"slowest={[(Path(p).name, round(t, 3)) for p, t in top_slowest]}"
-            )
 
         # Collect passed candidates from per-clip processing.
         passed_candidates = []  # (video_path, pose_ratio, clarity_ratio, embedding, duration_secs)
@@ -304,79 +305,140 @@ class V2ContentFilter:
 
     def _process_single_video(self, video_path: str) -> Tuple[
         str, bool, Optional[Tuple[float, float, np.ndarray]], Optional[str]]:
-        cap = cv2.VideoCapture(video_path)
-        try:
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            if total_frames == 0:
-                return video_path, False, None, 'no_frames'
+        total_frames = VU.get_video_frames(video_path)
+        if total_frames == 0:
+            return video_path, False, None, 'no_frames'
 
-            sampling_cfg = self.config.get('fine', {}).get('sampling', {})
-            sample_max = sampling_cfg.get('max_frames', 200)
-            sample_rate = sampling_cfg.get('rate', 0.1)
-            sample_count = max(1, min(sample_max, int(total_frames * sample_rate)))
-            sample_indices = np.linspace(0, total_frames - 1, sample_count, dtype=int)
-            sample_indices_set = set(int(i) for i in sample_indices.tolist())
-            sample_count = len(sample_indices_set)
+        if self.speech_required:
+            has_speech = self.speaker_detector.detect_speech_from_video(video_path)
+            if not has_speech:
+                return video_path, False, None, 'no_speech'
 
-            good_pose_count = 0
-            good_clarity_count = 0
-            sampled_face_detected = 0
-            representative_embedding = None
+        sampling_cfg = self.config.get('fine', {}).get('sampling', {})
+        sample_indices = self._sample_indices(
+            total_frames,
+            float(sampling_cfg.get('rate', 0.1)),
+            int(sampling_cfg.get('max_frames', 200)),
+        )
+        sampled_frames, _ = VU.read_sampled_frames(video_path, sample_indices)
+        if not sampled_frames:
+            return video_path, False, None, 'no_frames'
 
-            if self.speech_required:
-                # speaker_detector is used in read-only mode here.
-                has_speech = self.speaker_detector.detect_speech_from_video(video_path)
-                if not has_speech:
-                    return video_path, False, None, 'no_speech'
+        detections_by_frame: List[List[Detection]] = []
+        detector = self._get_batch_detector()
+        for frame_batch in self._batched(sampled_frames, self.batch_size):
+            detections_by_frame.extend(detector.detect_batch(frame_batch))
 
-            for frame_idx in range(total_frames):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if frame_idx not in sample_indices_set:
+        detected_frame_count = sum(1 for detections in detections_by_frame if detections)
+        face_ratio = detected_frame_count / len(sampled_frames)
+        if face_ratio < self.face_required_ratio:
+            return video_path, False, None, 'no_face_detected'
+
+        arcface_crops = []
+        landmark_frames = []
+        landmark_bboxes = []
+        clarity_crops = []
+        for frame, detections in zip(sampled_frames, detections_by_frame):
+            for detection in detections:
+                bbox = self._clip_bbox(detection.bbox, frame.shape)
+                if bbox is None:
+                    continue
+                x1, y1, x2, y2 = bbox.tolist()
+                face_crop = frame[y1:y2, x1:x2]
+                if face_crop.size == 0:
                     continue
 
-                face = self.face_embedder.extract(frame)
-                if not face:
-                    continue
+                clarity_crops.append(face_crop)
+                landmark_frames.append(frame)
+                landmark_bboxes.append(bbox.astype(np.float32))
+                arcface_crops.append(self._make_arcface_crop(frame, face_crop, detection))
 
-                sampled_face_detected += 1
+        total_faces = len(arcface_crops)
+        if total_faces == 0:
+            return video_path, False, None, 'no_face_detected'
 
-                bbox = face.bbox.astype(int)
-                face_img = frame[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-                if face_img.size == 0:
-                    continue
+        embeddings = self.face_embedder.embed_crops_batch(arcface_crops)
+        if embeddings.shape[0] == 0:
+            return video_path, False, None, 'no_face_detected'
+        representative_embedding = self._mean_embedding(embeddings)
 
-                pose_rad = face.pose
-                roll = pose_rad[0]
-                pitch = pose_rad[1]
-                yaw = pose_rad[2]
+        poses = self._get_landmark_pose().estimate_poses_batch(landmark_frames, landmark_bboxes)
+        good_pose_count = sum(
+            1 for pose in poses
+            if np.all(np.abs(pose) <= float(self.max_head_angle))
+        )
+        pose_ratio = good_pose_count / total_faces
 
-                max_angle = self.max_head_angle
-                if abs(yaw) <= max_angle and abs(pitch) <= max_angle and abs(roll) <= max_angle:
-                    good_pose_count += 1
+        good_clarity_count = sum(
+            1 for face_crop in clarity_crops
+            if compute_laplacian_variance(face_crop) > self.laplacian_threshold
+        )
+        clarity_ratio = good_clarity_count / total_faces
 
-                clarity = compute_laplacian_variance(face_img)
-                if clarity > self.laplacian_threshold:
-                    good_clarity_count += 1
+        if pose_ratio < self.head_pose_required_ratio:
+            return video_path, False, None, 'head_pose_out_of_range'
+        if clarity_ratio < self.laplacian_required_ratio:
+            return video_path, False, None, 'blurry_face'
 
-                if representative_embedding is None:
-                    representative_embedding = face.normed_embedding
+        return video_path, True, (pose_ratio, clarity_ratio, representative_embedding), None
 
-            if sampled_face_detected <= sample_count * 0.8:
-                return video_path, False, None, 'no_face_detected'
+    @staticmethod
+    def _sample_indices(total_frames: int, rate: float, max_frames: int) -> List[int]:
+        sample_count = max(1, min(max_frames, int(total_frames * rate)))
+        step = max(total_frames // sample_count, 1)
+        return list(range(0, total_frames, step))[:sample_count]
 
-            pose_ratio = good_pose_count / sampled_face_detected
-            clarity_ratio = good_clarity_count / sampled_face_detected
+    @staticmethod
+    def _batched(items: List[Any], batch_size: int) -> List[List[Any]]:
+        return [items[index:index + batch_size] for index in range(0, len(items), batch_size)]
 
-            if pose_ratio < self.head_pose_required_ratio:
-                return video_path, False, None, 'head_pose_out_of_range'
-            if clarity_ratio < self.laplacian_required_ratio:
-                return video_path, False, None, 'blurry_face'
+    @staticmethod
+    def _clip_bbox(bbox: np.ndarray, frame_shape: Tuple[int, int, int]) -> Optional[np.ndarray]:
+        x1, y1, x2, y2 = np.asarray(bbox).reshape(-1)[:4].astype(int)
+        h, w = frame_shape[:2]
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(0, min(x2, w))
+        y2 = max(0, min(y2, h))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return np.array([x1, y1, x2, y2], dtype=int)
 
-            return video_path, True, (pose_ratio, clarity_ratio, representative_embedding), None
-        finally:
-            cap.release()
+    @staticmethod
+    def _make_arcface_crop(frame: np.ndarray, face_crop: np.ndarray, detection: Detection) -> np.ndarray:
+        if detection.kps is not None:
+            return face_align.norm_crop(frame, landmark=detection.kps, image_size=112)
+        return cv2.resize(face_crop, (112, 112))
+
+    @staticmethod
+    def _mean_embedding(embeddings: np.ndarray) -> np.ndarray:
+        embedding = np.mean(embeddings, axis=0).astype(np.float32)
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+        return embedding
+
+    def _get_batch_detector(self) -> BatchSCRFDDetector:
+        if self._batch_detector is None:
+            detection_cfg = self.fine_cfg.get('face_detection', {})
+            self._batch_detector = BatchSCRFDDetector(
+                model_path=detection_cfg.get(
+                    'model_path',
+                    'models/insightface/scrfd_320_batched/scrfd_10g_320_batch.onnx',
+                ),
+                det_thresh=float(detection_cfg.get('det_thresh', 0.5)),
+                det_size=tuple(detection_cfg.get('det_size', [320, 320])),
+                batch_size=self.batch_size,
+            )
+        return self._batch_detector
+
+    def _get_landmark_pose(self) -> BatchLandmarkPose:
+        if self._landmark_pose is None:
+            self._landmark_pose = BatchLandmarkPose(
+                model_path=self.fine_cfg.get('landmark_model_path', '/root/.insightface/models/buffalo_m/1k3d68.onnx'),
+                batch_size=self.batch_size,
+            )
+        return self._landmark_pose
 
     def _update_feedback(self, fail_reason: str):
         if fail_reason in self.feedback['fail_reasons']:

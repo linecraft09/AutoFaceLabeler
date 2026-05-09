@@ -1,13 +1,16 @@
 import os
 import atexit
+from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 
+import cv2
 import faiss
 import numpy as np
 import torch
 from insightface.app import FaceAnalysis
 
 from aflutils.logger import get_logger
+from .ort_utils import DEFAULT_ARCFACE_BATCH_MODEL, create_session, resolve_model_path
 
 logger = get_logger(__name__)
 
@@ -15,12 +18,24 @@ logger = get_logger(__name__)
 class ArcFaceEmbedder:
     """ArcFace 人脸特征提取与向量库去重"""
 
-    def __init__(self, model_name: str = 'buffalo_m', device: str = 'cpu', db_path: str = 'data/face_index.faiss'):
+    def __init__(
+        self,
+        model_name: str = 'buffalo_m',
+        device: str = 'cpu',
+        db_path: str = 'data/face_index.faiss',
+        batch_model_path: str | Path = DEFAULT_ARCFACE_BATCH_MODEL,
+        batch_size: int = 16,
+    ):
         requested_device = (device or 'cpu').lower()
         self.device = 'cuda' if requested_device == 'cuda' and torch.cuda.is_available() else 'cpu'
         if requested_device == 'cuda' and self.device != 'cuda':
             logger.warning("CUDA requested for ArcFace but unavailable; falling back to CPU")
         self.db_path = db_path
+        self.batch_model_path = resolve_model_path(batch_model_path)
+        self.batch_size = int(batch_size)
+        self._batch_session = None
+        self._batch_input_name = None
+        self._batch_output_names = None
         # 初始化 FaceAnalysis
         providers = ['CUDAExecutionProvider'] if self.device == 'cuda' else ['CPUExecutionProvider']
         self.face_app = FaceAnalysis(name=model_name, providers=providers)
@@ -43,10 +58,16 @@ class ArcFaceEmbedder:
             logger.info("Created new FAISS index")
         self._last_saved_ntotal = self.index.ntotal
 
-    def _save_index(self):
+    def _save_index(self, log: bool = True):
+        if self.db_path == ':memory:':
+            return
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         faiss.write_index(self.index, self.db_path)
         self._last_saved_ntotal = self.index.ntotal
-        logger.info(f"Saved FAISS index to {self.db_path}, size={self.index.ntotal}")
+        if log:
+            logger.info(f"Saved FAISS index to {self.db_path}, size={self.index.ntotal}")
 
     def flush(self):
         """写回未持久化的向量，确保增量写入不会在异常退出时丢失。"""
@@ -58,7 +79,7 @@ class ArcFaceEmbedder:
             return
         try:
             self._flush_lock = True
-            self._save_index()
+            self._save_index(log=False)
         except Exception as e:
             logger.error(f"Failed to flush FAISS index: {e}", exc_info=True)
         finally:
@@ -77,6 +98,46 @@ class ArcFaceEmbedder:
         self.index.add(embedding.reshape(1, -1))
         if self.index.ntotal % 10 == 0:
             self._save_index()
+
+    def _get_batch_session(self):
+        if self._batch_session is None:
+            self._batch_session = create_session(self.batch_model_path)
+            self._batch_input_name = self._batch_session.get_inputs()[0].name
+            self._batch_output_names = [item.name for item in self._batch_session.get_outputs()]
+        return self._batch_session
+
+    def embed_crops_batch(self, face_crops: list[np.ndarray]) -> np.ndarray:
+        """
+        Extract normalized ArcFace embeddings from a batch of aligned or cropped faces.
+
+        Returns:
+            A float32 array with shape [N, 512].
+        """
+        if not face_crops:
+            return np.empty((0, self.dim), dtype=np.float32)
+
+        session = self._get_batch_session()
+        embeddings = []
+        for start in range(0, len(face_crops), self.batch_size):
+            crops = face_crops[start : start + self.batch_size]
+            prepared = []
+            for crop in crops:
+                if crop is None or crop.size == 0:
+                    raise ValueError("face_crops contains an empty crop")
+                prepared.append(cv2.resize(crop, (112, 112)))
+            blob = cv2.dnn.blobFromImages(
+                prepared,
+                1.0 / 127.5,
+                (112, 112),
+                (127.5, 127.5, 127.5),
+                swapRB=True,
+            )
+            output = session.run(self._batch_output_names, {self._batch_input_name: blob})[0]
+            if output.shape != (len(prepared), self.dim):
+                raise RuntimeError(f"ArcFace output shape mismatch: expected {(len(prepared), self.dim)}, got {output.shape}")
+            norms = np.linalg.norm(output, axis=1, keepdims=True)
+            embeddings.append((output / np.maximum(norms, 1e-12)).astype(np.float32))
+        return np.vstack(embeddings)
 
     def __del__(self):
         try:
