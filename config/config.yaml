@@ -8,6 +8,7 @@ project:
 # === Search & Discovery ===
 search:
   platforms: ['youtube', 'bilibili']
+  cookies: 'config/cookies_netscape.txt'
   per_platform_results: 20
   detail_workers: 5
   fast_search:
@@ -23,6 +24,7 @@ search:
 # === Download ===
 download:
   format: 'bestvideo[height>=720]+bestaudio/best'
+  cookies: 'config/cookies_netscape.txt'
   merge_output_format: 'mkv'
   concurrent_fragments: 5
   retries: 10

@@ -1,7 +1,7 @@
 download:
   concurrent_fragments: 2
   continue_dl: true
-  format: bestvideo+bestaudio/best
+  format: best[height<=720]
   fragment_retries: 2
   ignoreerrors: true
   max_sleep_interval: 2
@@ -12,6 +12,8 @@ download:
   retries: 2
   sleep_interval: 1
   user_agent: Mozilla/5.0
+  cookies: config/cookies_netscape.txt
+  proxy: http://127.0.0.1:7890
 explorer:
   initial_search_terms:
   - category: interview
@@ -29,6 +31,19 @@ explorer:
   - category: educational
     platform: bilibili
     text: 教程
+    weight: 1.0
+  # YouTube 搜索词
+  - category: vlog
+    platform: youtube
+    text: short vlog
+    weight: 1.0
+  - category: interview
+    platform: youtube
+    text: short interview
+    weight: 1.0
+  - category: educational
+    platform: youtube
+    text: tutorial short
     weight: 1.0
   llm:
     api_key_env: OPENAI_API_KEY
@@ -70,6 +85,9 @@ search:
   per_platform_results: 5
   platforms:
   - bilibili
+  - youtube
+  cookies: config/cookies_netscape.txt
+  proxy: http://127.0.0.1:7890
 v1_filter:
   channel_blacklist:
   - GameGrub

@@ -81,6 +81,21 @@ class BaseDownloader(ABC):
             self.logger.warning("No configuration provided. Using empty config.")
             self.config = {}
 
+        # If config doesn't specify a proxy, try environment variables
+        if "proxy" not in self.config or not self.config.get("proxy"):
+            proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+            if proxy:
+                self.config["proxy"] = proxy
+                self.logger.info(f"Proxy loaded from environment: {proxy}")
+
+        # Map 'cookies' config key to yt-dlp's 'cookiefile' option
+        if self.config.get("cookies"):
+            self.config["cookiefile"] = self.config["cookies"]
+            self.logger.info(f"Cookies loaded from: {self.config['cookies']}")
+
+        # Add remote_components for yt-dlp remote extraction (JS challenge etc.)
+        self.config.setdefault('remote_components', ['ejs:github'])
+
         # Convert list back to tuple for 'cookiesfrombrowser' if present
         if "cookiesfrombrowser" in self.config and isinstance(
                 self.config["cookiesfrombrowser"], list

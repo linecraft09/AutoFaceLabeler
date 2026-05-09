@@ -10,7 +10,8 @@ from aflutils.logger import get_logger
 
 logger = get_logger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-load_dotenv(PROJECT_ROOT / "api_key.env")
+load_dotenv(PROJECT_ROOT / "api_key.env")  # legacy file, kept for backward compatibility
+load_dotenv(PROJECT_ROOT / ".env")  # new central env file, overrides api_key.env if same key exists
 
 
 class LLMOptimizer:

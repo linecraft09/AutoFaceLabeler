@@ -27,13 +27,16 @@ class YtDlpSearchApi(SearchApi):
     """基于 yt-dlp 的搜索实现 (支持 YouTube 和 BiliBili)，采用混合策略获取分辨率"""
 
     def __init__(self, platform: str, proxy: str = None, user_agent: str = None,
-                 video_store: Optional[VideoStore] = None, search_config: Optional[dict] = None):
+                 video_store: Optional[VideoStore] = None, search_config: Optional[dict] = None,
+                 cookies: str = None):
         """
         :param platform: 'youtube' 或 'bilibili'
+        :param cookies: 可选的 cookies.txt 文件路径（用于 yt-dlp 认证访问）
         """
         self.platform = platform.lower()
         self.video_store = video_store
         self.search_config = search_config or {}
+        self._cookies = cookies or self.search_config.get('cookies')
         if self.platform not in ['youtube', 'bilibili']:
             raise ValueError("platform must be 'youtube' or 'bilibili'")
 
@@ -58,22 +61,26 @@ class YtDlpSearchApi(SearchApi):
             ),
             'max_sleep_interval': fast_cfg.get('max_sleep_interval', 10),
             'sleep_interval_requests': random.uniform(2, 5),
-            # 'cookiefile': 'cookies.txt',  # 取消注释并设置路径以使用 cookie
             'nocheckcertificate': False,
             'prefer_insecure': False,
             'extractor_retries': fast_cfg.get('extractor_retries', 3),
             'file_access_retries': fast_cfg.get('file_access_retries', 3),
             "socket_timeout": fast_cfg.get('socket_timeout', 30),
+            'remote_components': ['ejs:github'],
         }
         if proxy:
             self.ydl_opts_fast['proxy'] = proxy
         if user_agent:
             self.ydl_opts_fast['user_agent'] = user_agent
+        if self._cookies:
+            self.ydl_opts_fast['cookiefile'] = self._cookies
 
         # 详细配置（用于获取单个视频详情，extract_flat=False）
         self.ydl_opts_detail = copy.deepcopy(self.ydl_opts_fast)
         self.ydl_opts_detail['extract_flat'] = False
-        self.ydl_opts_detail['cookiefile'] = None
+        if self._cookies:
+            self.ydl_opts_detail['cookiefile'] = self._cookies
+        self.ydl_opts_detail['remote_components'] = ['ejs:github']
         # 详细模式可能需要更长的超时
         self.ydl_opts_detail['socket_timeout'] = detail_cfg.get('socket_timeout', 60)
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Union
 
 import yaml
+from dotenv import load_dotenv
 from aflutils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -30,6 +31,12 @@ class ConfigLoader:
         :param config_path: YAML 配置文件路径
         :param load_env: 是否进行环境变量替换，默认为 True
         """
+        # 在加载 YAML 前先加载 .env 文件，确保 ${VAR} 替换能获取到环境变量
+        dotenv_path = Path(config_path).resolve().parent.parent / '.env'
+        if dotenv_path.exists():
+            load_dotenv(dotenv_path=dotenv_path, override=True)
+        load_dotenv(override=True)  # also try from CWD / default path
+
         self.config_path = Path(config_path)
         self._raw_config: Dict[str, Any] = {}
         self._config: Dict[str, Any] = {}

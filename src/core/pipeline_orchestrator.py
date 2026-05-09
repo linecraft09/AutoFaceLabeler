@@ -1,3 +1,4 @@
+import os
 import time
 import threading
 from pathlib import Path
@@ -46,8 +47,17 @@ def run_pipeline(config=None):
     # 初始化视频存储
     video_store = VideoStore(db_path=config.get('project', {}).get('video_db', './data/videos.db'))
     search_cfg = config.get('search', {})
-    yt_searcher = YtDlpSearchApi(platform='youtube', video_store=video_store, search_config=search_cfg)
-    bl_searcher = YtDlpSearchApi(platform='bilibili', video_store=video_store, search_config=search_cfg)
+    # 尝试从环境变量获取代理（.env 或系统环境变量）
+    proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY') or None
+
+    yt_searcher = YtDlpSearchApi(
+        platform='youtube', proxy=proxy, video_store=video_store,
+        search_config=search_cfg, cookies=search_cfg.get('cookies')
+    )
+    bl_searcher = YtDlpSearchApi(
+        platform='bilibili', proxy=proxy, video_store=video_store,
+        search_config=search_cfg, cookies=search_cfg.get('cookies')
+    )
 
     # 初始化并启动 V2 后台线程
     v2_config = config.get('v2_filter', {})
