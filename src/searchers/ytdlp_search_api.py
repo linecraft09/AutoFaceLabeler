@@ -8,6 +8,7 @@ import yt_dlp
 from yt_dlp.utils import DownloadError, ExtractorError
 
 from aflutils.logger import get_logger
+from aflutils.platform_cookies import resolve_platform_cookies
 from core.models.video_meta import VideoMeta
 from core.storage.video_store import VideoStore
 from .search_api import SearchApi
@@ -36,7 +37,7 @@ class YtDlpSearchApi(SearchApi):
         self.platform = platform.lower()
         self.video_store = video_store
         self.search_config = search_config or {}
-        self._cookies = cookies or self.search_config.get('cookies')
+        self._cookies = cookies or resolve_platform_cookies(self.search_config, self.platform)
         if self.platform not in ['youtube', 'bilibili']:
             raise ValueError("platform must be 'youtube' or 'bilibili'")
 

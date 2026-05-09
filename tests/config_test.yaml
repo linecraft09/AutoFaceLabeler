@@ -12,8 +12,12 @@ download:
   retries: 2
   sleep_interval: 1
   user_agent: Mozilla/5.0
+  platforms:
+    youtube:
+      cookies: config/youtube_cookies.txt
+    bilibili:
+      cookies: config/bilibili_cookies.txt
   proxy: http://127.0.0.1:7890
-  cookies: config/cookies_netscape.txt
 explorer:
   initial_search_terms:
   - category: interview
@@ -32,6 +36,7 @@ explorer:
     platform: bilibili
     text: 教程
     weight: 1.0
+  # YouTube 搜索词
   - category: vlog
     platform: youtube
     text: short vlog
@@ -83,10 +88,11 @@ search:
     socket_timeout: 20
   per_platform_results: 5
   platforms:
-  - bilibili
-  - youtube
+    youtube:
+      cookies: config/youtube_cookies.txt
+    bilibili:
+      cookies: config/bilibili_cookies.txt
   proxy: http://127.0.0.1:7890
-  cookies: config/cookies_netscape.txt
 v1_filter:
   channel_blacklist:
   - GameGrub

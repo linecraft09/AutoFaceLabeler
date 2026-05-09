@@ -41,6 +41,8 @@ Latex/
 
 # Likely personal/sensitive files
 cookies.txt
+config/youtube_cookies.txt
+config/bilibili_cookies.txt
 *.pem
 *.key
 *.p12

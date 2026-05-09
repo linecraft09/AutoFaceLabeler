@@ -191,11 +191,11 @@ def run_pipeline(config=None):
         if not _skip_stage(resume_stage, "search"):
             yt_searcher = YtDlpSearchApi(
                 platform='youtube', proxy=proxy, video_store=video_store,
-                search_config=search_cfg, cookies=search_cfg.get('cookies')
+                search_config=search_cfg
             )
             bl_searcher = YtDlpSearchApi(
                 platform='bilibili', proxy=proxy, video_store=video_store,
-                search_config=search_cfg, cookies=search_cfg.get('cookies')
+                search_config=search_cfg
             )
 
         # 初始化 V2，实际启动延后到 v1 阶段之后，便于按阶段恢复。

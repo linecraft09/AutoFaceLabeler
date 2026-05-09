@@ -21,6 +21,7 @@ import yaml
 import yt_dlp
 
 from aflutils.logger import get_logger
+from aflutils.platform_cookies import detect_platform_from_url, resolve_platform_cookies
 
 logger = get_logger(__name__)
 
@@ -88,7 +89,8 @@ class BaseDownloader(ABC):
                 self.config["proxy"] = proxy
                 self.logger.info(f"Proxy loaded from environment: {proxy}")
 
-        # Map 'cookies' config key to yt-dlp's 'cookiefile' option
+        # Map legacy top-level 'cookies' config key to yt-dlp's 'cookiefile' option.
+        # Platform-specific cookies are applied per URL in DefaultDownloader.
         if self.config.get("cookies"):
             self.config["cookiefile"] = self.config["cookies"]
             self.logger.info(f"Cookies loaded from: {self.config['cookies']}")
@@ -214,6 +216,10 @@ class DefaultDownloader(BaseDownloader):
     """Default downloader with no per-URL option overrides."""
 
     def get_options_for_url(self, url: str) -> Dict[str, Any]:
+        platform = detect_platform_from_url(url)
+        cookies = resolve_platform_cookies(self.config, platform)
+        if cookies:
+            return {"cookiefile": cookies}
         return {}
 
     def on_download_complete(self, url: str, info: Dict[str, Any]) -> None:

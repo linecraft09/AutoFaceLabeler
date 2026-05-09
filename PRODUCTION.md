@@ -31,7 +31,7 @@ HTTP_PROXY=http://127.0.0.1:7890
 OPENAI_API_KEY=sk-your-key-here
 
 # YouTube cookies 路径
-YOUTUBE_COOKIES_PATH=config/cookies_netscape.txt
+YOUTUBE_COOKIES_PATH=config/youtube_cookies.txt
 ```
 
 `.env.example` 已提供模板，可参考。
@@ -44,14 +44,21 @@ YOUTUBE_COOKIES_PATH=config/cookies_netscape.txt
 
 ```yaml
 search:
-  platforms: ['youtube', 'bilibili']   # 搜索平台
-  cookies: 'config/cookies_netscape.txt'  # YouTube cookies
+  platforms:
+    youtube:
+      cookies: 'config/youtube_cookies.txt'
+    bilibili:
+      cookies: 'config/bilibili_cookies.txt'
   proxy: 'http://127.0.0.1:7890'       # 代理
   per_platform_results: 5              # 每平台每次搜索数
 
 download:
   format: 'best[height<=720]'          # 限制分辨率加速下载
-  cookies: 'config/cookies_netscape.txt'
+  platforms:
+    youtube:
+      cookies: 'config/youtube_cookies.txt'
+    bilibili:
+      cookies: 'config/bilibili_cookies.txt'
   proxy: 'http://127.0.0.1:7890'
   outtmpl: '/tmp/afl_raw/%(id)s/%(title)s [%(id)s].%(ext)s'
 
@@ -79,8 +86,10 @@ explorer:
 ## 4. YouTube Cookies 准备
 
 1. 从浏览器导出 YouTube cookies（Netscape 格式）
-2. 保存为 `config/cookies_netscape.txt`
-3. 已在 `.gitignore` 中排除
+2. 保存为 `config/youtube_cookies.txt`
+3. 设置为只读：`chmod 444 config/youtube_cookies.txt`
+4. Bilibili 使用独立的可写 visitor cookie 文件：`config/bilibili_cookies.txt`
+5. 两个 cookie 文件都已在 `.gitignore` 中排除
 
 **获取方式**：浏览器安装 "Get cookies.txt LOCALLY" 扩展 → 访问 YouTube → 导出。
 
@@ -282,7 +291,7 @@ rm -f /tmp/afl_test_faces.faiss
 
 - [ ] 确认 Mihomo 代理运行：`curl -x http://127.0.0.1:7890 -s -o /dev/null -w "%{http_code}" https://www.youtube.com` → 200
 - [ ] 确认 conda 环境：`conda run -n afl python -c "import torch; print(torch.cuda.is_available())"` → True
-- [ ] 确认 cookies 有效：`ls -l config/cookies_netscape.txt`
+- [ ] 确认 cookies 有效：`ls -l config/youtube_cookies.txt config/bilibili_cookies.txt`
 - [ ] 确认 `.env` 已配置
 - [ ] 确认 `config.yaml` 路径正确（生产环境不用 `/tmp`）
 - [ ] 修改 `config.yaml` 中 `project.*` 路径为持久化目录

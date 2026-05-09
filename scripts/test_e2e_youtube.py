@@ -12,7 +12,7 @@ import yt_dlp
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-COOKIES = str(PROJECT_ROOT / 'config' / 'cookies_netscape.txt')
+COOKIES = str(PROJECT_ROOT / 'config' / 'youtube_cookies.txt')
 PROXY = os.getenv('HTTPS_PROXY', 'http://127.0.0.1:7890')
 DOWNLOAD_DIR = tempfile.mkdtemp(prefix='afl_e2e_')
 
@@ -94,8 +94,8 @@ print("=" * 60)
 try:
     from aflutils.config_loader import ConfigLoader
     loader = ConfigLoader(str(PROJECT_ROOT / 'config' / 'config.yaml'))
-    print(f"search.cookies = {loader.get('search.cookies')}")
-    print(f"download.cookies = {loader.get('download.cookies')}")
+    print(f"search.platforms.youtube.cookies = {loader.get('search.platforms.youtube.cookies')}")
+    print(f"download.platforms.youtube.cookies = {loader.get('download.platforms.youtube.cookies')}")
     print("Config loaded OK")
 except Exception as e:
     print(f"Config load warning (may be OK if schema strict): {e}")
