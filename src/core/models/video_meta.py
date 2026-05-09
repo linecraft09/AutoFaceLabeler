@@ -1,6 +1,6 @@
 # src/core/models/video_meta.py
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import List, Dict, Any
 
 
 @dataclass
@@ -18,3 +18,16 @@ class VideoMeta:
     search_term: str  # 产生该视频的搜索词
     # 后续过滤会添加额外字段
     extra: Dict = None
+
+    def __getitem__(self, key: str) -> Any:
+        if hasattr(self, key):
+            return getattr(self, key)
+        if self.extra and key in self.extra:
+            return self.extra[key]
+        raise KeyError(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default

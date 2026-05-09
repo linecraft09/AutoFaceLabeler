@@ -1,14 +1,12 @@
-# === Project Paths ===
 project:
-  data_dir: './data'
-  video_db: './data/videos.db'
-  explorer_state: './data/explorer.json'
-  logs_dir: './logs'
-
-# === Search & Discovery ===
+  data_dir: ./data
+  video_db: ./data/videos.db
+  explorer_state: ./data/explorer.json
+  logs_dir: ./logs
 search:
-  platforms: ['youtube', 'bilibili']
-  cookies: 'config/cookies_netscape.txt'
+  platforms:
+  - youtube
+  - bilibili
   per_platform_results: 20
   detail_workers: 5
   fast_search:
@@ -20,25 +18,23 @@ search:
     max_sleep_interval: 10
   detail_fetch:
     socket_timeout: 60
-
-# === Download ===
+  cookies: config/cookies_netscape.txt
 download:
-  format: 'bestvideo[height>=720]+bestaudio/best'
-  cookies: 'config/cookies_netscape.txt'
-  merge_output_format: 'mkv'
+  format: bestvideo[height>=720]+bestaudio/best
+  merge_output_format: mkv
   concurrent_fragments: 5
   retries: 10
   fragment_retries: 10
   continue_dl: true
   sleep_interval: 5
   max_sleep_interval: 15
-  user_agent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  outtmpl: './data/raw/%(id)s/%(title)s [%(id)s].%(ext)s'
+  user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
+    like Gecko) Chrome/120.0.0.0 Safari/537.36
+  outtmpl: ./data/raw/%(id)s/%(title)s [%(id)s].%(ext)s
   nooverwrites: true
   restrictfilenames: true
   ignoreerrors: true
-
-# === Pipeline Orchestrator ===
+  cookies: config/cookies_netscape.txt
 pipeline:
   target_qualified: 200
   batch_size: 10
@@ -46,90 +42,195 @@ pipeline:
   pending_ratio_threshold: 0.5
   pending_wait_seconds: 60
   auto_cleanup_stale: true
-
-# === Explorer & Scheduling ===
+housekeeping:
+  enabled: true
+  stale_lease_reap: true
+  orphaned_checkpoint_cleanup: true
+  keep_last_runs: 100
 explorer:
   initial_search_terms:
-    # ========== 访谈类 (interview) ==========
-    - { text: "人物专访", platform: bilibili, category: interview, weight: 1.0 }
-    - { text: "深度访谈", platform: bilibili, category: interview, weight: 1.0 }
-    - { text: "UP主访谈", platform: bilibili, category: interview, weight: 0.9 }
-    - { text: "interview", platform: youtube, category: interview, weight: 1.0 }
-    - { text: "talk show", platform: youtube, category: interview, weight: 0.9 }
-    - { text: "Q&A", platform: youtube, category: interview, weight: 0.8 }
-    - { text: "podcast solo", platform: youtube, category: interview, weight: 0.8 }
-    # ========== 教育类 (educational) ==========
-    - { text: "tutorial", platform: youtube, category: educational, weight: 1.0 }
-    - { text: "how to", platform: youtube, category: educational, weight: 0.9 }
-    - { text: "lecture", platform: youtube, category: educational, weight: 0.8 }
-    - { text: "presentation", platform: youtube, category: educational, weight: 0.7 }
-    - { text: "科普讲解", platform: bilibili, category: educational, weight: 1.0 }
-    - { text: "知识分享", platform: bilibili, category: educational, weight: 0.9 }
-    - { text: "公开课", platform: bilibili, category: educational, weight: 0.8 }
-    # ========== Vlog类 (vlog) ==========
-    - { text: "vlog", platform: youtube, category: vlog, weight: 1.0 }
-    - { text: "daily vlog", platform: youtube, category: vlog, weight: 0.9 }
-    - { text: "solo vlog", platform: youtube, category: vlog, weight: 1.0 }
-    - { text: "morning routine", platform: youtube, category: vlog, weight: 0.7 }
-    - { text: "日常Vlog", platform: bilibili, category: vlog, weight: 1.0 }
-    - { text: "独居日常", platform: bilibili, category: vlog, weight: 0.9 }
-    - { text: "生活记录", platform: bilibili, category: vlog, weight: 0.8 }
-    # ========== 美妆/穿搭类 (beauty) ==========
-    - { text: "makeup tutorial", platform: youtube, category: beauty, weight: 1.0 }
-    - { text: "skincare routine", platform: youtube, category: beauty, weight: 0.9 }
-    - { text: "fashion haul", platform: youtube, category: beauty, weight: 0.8 }
-    - { text: "美妆教程", platform: bilibili, category: beauty, weight: 1.0 }
-    - { text: "穿搭分享", platform: bilibili, category: beauty, weight: 0.9 }
-    - { text: "护肤分享", platform: bilibili, category: beauty, weight: 0.8 }
-    # ========== 评测/解说类 (review) ==========
-    - { text: "product review", platform: youtube, category: review, weight: 1.0 }
-    - { text: "unboxing", platform: youtube, category: review, weight: 0.9 }
-    - { text: "tech review", platform: youtube, category: review, weight: 0.8 }
-    - { text: "数码评测", platform: bilibili, category: review, weight: 1.0 }
-    - { text: "游戏解说", platform: bilibili, category: review, weight: 0.8 }
-    - { text: "影视解说", platform: bilibili, category: review, weight: 0.7 }
+  - text: 人物专访
+    platform: bilibili
+    category: interview
+    weight: 1.0
+  - text: 深度访谈
+    platform: bilibili
+    category: interview
+    weight: 1.0
+  - text: UP主访谈
+    platform: bilibili
+    category: interview
+    weight: 0.9
+  - text: interview
+    platform: youtube
+    category: interview
+    weight: 1.0
+  - text: talk show
+    platform: youtube
+    category: interview
+    weight: 0.9
+  - text: Q&A
+    platform: youtube
+    category: interview
+    weight: 0.8
+  - text: podcast solo
+    platform: youtube
+    category: interview
+    weight: 0.8
+  - text: tutorial
+    platform: youtube
+    category: educational
+    weight: 1.0
+  - text: how to
+    platform: youtube
+    category: educational
+    weight: 0.9
+  - text: lecture
+    platform: youtube
+    category: educational
+    weight: 0.8
+  - text: presentation
+    platform: youtube
+    category: educational
+    weight: 0.7
+  - text: 科普讲解
+    platform: bilibili
+    category: educational
+    weight: 1.0
+  - text: 知识分享
+    platform: bilibili
+    category: educational
+    weight: 0.9
+  - text: 公开课
+    platform: bilibili
+    category: educational
+    weight: 0.8
+  - text: vlog
+    platform: youtube
+    category: vlog
+    weight: 1.0
+  - text: daily vlog
+    platform: youtube
+    category: vlog
+    weight: 0.9
+  - text: solo vlog
+    platform: youtube
+    category: vlog
+    weight: 1.0
+  - text: morning routine
+    platform: youtube
+    category: vlog
+    weight: 0.7
+  - text: 日常Vlog
+    platform: bilibili
+    category: vlog
+    weight: 1.0
+  - text: 独居日常
+    platform: bilibili
+    category: vlog
+    weight: 0.9
+  - text: 生活记录
+    platform: bilibili
+    category: vlog
+    weight: 0.8
+  - text: makeup tutorial
+    platform: youtube
+    category: beauty
+    weight: 1.0
+  - text: skincare routine
+    platform: youtube
+    category: beauty
+    weight: 0.9
+  - text: fashion haul
+    platform: youtube
+    category: beauty
+    weight: 0.8
+  - text: 美妆教程
+    platform: bilibili
+    category: beauty
+    weight: 1.0
+  - text: 穿搭分享
+    platform: bilibili
+    category: beauty
+    weight: 0.9
+  - text: 护肤分享
+    platform: bilibili
+    category: beauty
+    weight: 0.8
+  - text: product review
+    platform: youtube
+    category: review
+    weight: 1.0
+  - text: unboxing
+    platform: youtube
+    category: review
+    weight: 0.9
+  - text: tech review
+    platform: youtube
+    category: review
+    weight: 0.8
+  - text: 数码评测
+    platform: bilibili
+    category: review
+    weight: 1.0
+  - text: 游戏解说
+    platform: bilibili
+    category: review
+    weight: 0.8
+  - text: 影视解说
+    platform: bilibili
+    category: review
+    weight: 0.7
   llm:
     enabled: true
-    model: "deepseek-chat"
-    api_key_env: "OPENAI_API_KEY"
-    base_url: "https://api.deepseek.com"
+    model: deepseek-chat
+    api_key_env: OPENAI_API_KEY
+    base_url: https://api.deepseek.com
     temperature: 0.7
     optimization_trigger_v2_pass_rate: 0.02
-    optimization_trigger_v1_pass_rate: 0.10
+    optimization_trigger_v1_pass_rate: 0.1
   sampling:
     target_distribution:
       interview: 0.25
       educational: 0.25
-      vlog: 0.20
+      vlog: 0.2
       beauty: 0.15
       review: 0.15
     min_weight: 0.1
     weight_decay_factor: 0.9
-
-# === V1 Pre-filter ===
 v1_filter:
   min_duration: 30
   max_duration: 1800
   min_resolution: 720
   min_views: 1000
-  title_blacklist: ["reaction", "multi", "多人", "合集", "replay"]
-  channel_blacklist: ["GameGrub", "群访"]
+  title_blacklist:
+  - reaction
+  - multi
+  - 多人
+  - 合集
+  - replay
+  channel_blacklist:
+  - GameGrub
+  - 群访
   tags_whitelist: []
-
-# === V2 Content Filter ===
 v2_filter:
-  device: 'cuda'
-  qualified_dir: './data/qualified'
+  device: cuda
+  qualified_dir: ./data/qualified
   pending_limit: 5
   poll_interval_seconds: 5
+  claim_lease_seconds: 600
+  max_retries: 3
+  checkpoint:
+    dir: ./data/checkpoints
   coarse:
-    model_path: 'yolo11n.pt'
+    model_path: yolo11n.pt
     batch_size: 16
     single_person_threshold: 0.8
     audio_required: true
   fine:
-    model_name: 'buffalo_m'
-    face_db_path: './data/face_index.faiss'
+    model_name: buffalo_m
+    face_db_path: ./data/face_index.faiss
+    rebuild_faiss_on_startup: false
     dedup_threshold: 0.75
     speech_required: true
     head_pose:
@@ -145,4 +246,6 @@ v2_filter:
     face_detection:
       model_path: models/insightface/scrfd_320_batched/scrfd_10g_320_batch.onnx
       det_thresh: 0.5
-      det_size: [320, 320]
+      det_size:
+      - 320
+      - 320

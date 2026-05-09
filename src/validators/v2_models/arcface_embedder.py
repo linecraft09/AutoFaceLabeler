@@ -58,6 +58,21 @@ class ArcFaceEmbedder:
             logger.info("Created new FAISS index")
         self._last_saved_ntotal = self.index.ntotal
 
+    @classmethod
+    def rebuild_from_db(cls, video_store, dim=512) -> faiss.Index:
+        """Rebuild a FAISS index from SQLite-persisted embeddings."""
+        _, embeddings = video_store.load_all_embeddings()
+        index = faiss.IndexFlatL2(dim)
+        if not embeddings:
+            return index
+
+        embeddings_array = np.vstack([
+            np.asarray(embedding, dtype=np.float32).reshape(dim,)
+            for embedding in embeddings
+        ]).astype(np.float32)
+        index.add(embeddings_array)
+        return index
+
     def _save_index(self, log: bool = True):
         if self.db_path == ':memory:':
             return

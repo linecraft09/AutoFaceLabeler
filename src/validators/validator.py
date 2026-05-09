@@ -1,4 +1,6 @@
+import json
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -11,7 +13,7 @@ from insightface.utils import face_align
 
 import aflutils.video_utils as VU
 from aflutils.logger import get_logger
-from core.storage.video_store import VideoStore
+from core.storage.video_store import VideoStatus, VideoStore
 from .v2_models.arcface_embedder import ArcFaceEmbedder
 from .v2_models.face_quality import compute_laplacian_variance
 from .v2_models.landmark_batch import BatchLandmarkPose
@@ -29,6 +31,12 @@ class V2ContentFilter:
         self.explorer = explorer
         self.stop_event = threading.Event()
         self.thread = None
+        self.claim_lease_seconds = int(config.get('claim_lease_seconds', 600))
+        self.max_retries = int(config.get('max_retries', 3))
+        checkpoint_cfg = config.get('checkpoint', {}) if isinstance(config, dict) else {}
+        self.checkpoint_dir = Path(checkpoint_cfg.get('dir', './data/checkpoints'))
+        if hasattr(self.store, 'set_max_retries'):
+            self.store.set_max_retries(self.max_retries)
 
         yolo_cfg = config.get('coarse', {})
         self.yolo = YOLODetector(
@@ -54,6 +62,7 @@ class V2ContentFilter:
         self.batch_size = int(fine_cfg.get('batch_size', 16))
         self._batch_detector = None
         self._landmark_pose = None
+        self._fine_checkpoint_context = None
 
         self.known_embeddings = []
         self.max_head_angle = head_pose_cfg.get('max_angle', 10)
@@ -67,6 +76,7 @@ class V2ContentFilter:
             db_path=fine_cfg.get('face_db_path', 'data/face_index.faiss'),
             batch_size=self.batch_size,
         )
+        self._maybe_rebuild_faiss_index(fine_cfg)
 
         self.speech_required = fine_cfg.get('speech_required', False)
         if self.speech_required:
@@ -109,7 +119,13 @@ class V2ContentFilter:
 
     def _run_loop(self):
         while not self.stop_event.is_set():
-            pending = self.store.get_pending_videos(limit=self.config.get('pending_limit', 5))
+            batch_size = int(self.config.get('pending_limit', 5))
+            thread_name = threading.current_thread().name
+            pending = self.store.claim_pending_videos(
+                limit=batch_size,
+                owner=thread_name,
+                lease_seconds=self.claim_lease_seconds,
+            )
             if not pending:
                 time.sleep(self.config.get('poll_interval_seconds', 5))
                 continue
@@ -122,9 +138,10 @@ class V2ContentFilter:
                 except Exception as e:
                     logger.error(f"V2 filter failed on video {video_row.get('video_id', '?')}: {e}", exc_info=True)
                     try:
-                        self.store.update_status(
-                            video_row['video_id'], video_row.get('platform', ''),
-                            'v2_failed', f'v2_exception: {e}'
+                        self._fail_or_update(
+                            video_row,
+                            f'v2_exception: {e}',
+                            retry_within_seconds=60,
                         )
                     except Exception as status_e:
                         logger.error(f"Failed to update error status: {status_e}")
@@ -135,31 +152,83 @@ class V2ContentFilter:
         file_path = video_row['file_path']
         if not file_path or not os.path.exists(file_path):
             logger.warning(f"Video file missing: {file_path}")
-            self.store.update_status(video_id, platform, 'v2_failed', 'file_missing')
+            self._fail_or_update(video_row, 'file_missing')
             return
 
         generated_clip_paths: List[str] = []
+        cleanup_generated_clips = False
         try:
-            coarse_result, coarse_fail_reason, clip_paths = self._coarse_filter(file_path)
+            cached_coarse = self._load_coarse_checkpoint(video_id, platform)
+            if cached_coarse is not None:
+                coarse_result = True
+                coarse_fail_reason = None
+                clip_paths = cached_coarse.get('clip_paths', [])
+                logger.info(f"Loaded coarse checkpoint for {platform}:{video_id}")
+            else:
+                coarse_result, coarse_fail_reason, clip_paths = self._coarse_filter(file_path)
+                if coarse_result:
+                    self._save_coarse_checkpoint(video_id, platform, clip_paths)
             generated_clip_paths = clip_paths
             if not coarse_result:
-                self.store.update_status(video_id, platform, 'v2_coarse_failed', coarse_fail_reason)
+                self._complete_or_update(video_row, 'v2_coarse_failed', coarse_fail_reason)
+                cleanup_generated_clips = True
                 self._update_feedback(coarse_fail_reason)
                 logger.info(f"Video {video_id} doesn't pass coarse filter because of {coarse_fail_reason}")
                 return
             self.feedback['coarse_pass'] += 1
             logger.info(f"Video {video_id} passed coarse filter")
 
-            clip_path, fine_fail_reason = self._fine_filter(clip_paths)
+            fine_checkpoint = self.store.load_checkpoint(video_id, platform, 'fine')
+            processed_indices = set()
+            if fine_checkpoint:
+                processed_indices = {
+                    int(index)
+                    for index in fine_checkpoint.get('processed_indices', [])
+                }
+                logger.info(
+                    f"Loaded fine checkpoint for {platform}:{video_id}, "
+                    f"processed={len(processed_indices)}/{len(clip_paths)}"
+                )
+
+            remaining_pairs = [
+                (index, clip_path)
+                for index, clip_path in enumerate(clip_paths)
+                if index not in processed_indices
+            ]
+            if not remaining_pairs and processed_indices:
+                clip_path = None
+                fine_fail_reason = None
+                logger.info(f"All fine-filter clips already processed for {platform}:{video_id}")
+            else:
+                remaining_indices = [index for index, _ in remaining_pairs]
+                remaining_clip_paths = [path for _, path in remaining_pairs]
+                self._begin_fine_checkpoint(video_id, platform, processed_indices, remaining_indices)
+                try:
+                    clip_path, fine_fail_reason = self._fine_filter(
+                        remaining_clip_paths,
+                        video_id=video_id,
+                        platform=platform,
+                    )
+                finally:
+                    self._end_fine_checkpoint()
+                all_indices = list(range(len(clip_paths)))
+                self.store.save_checkpoint(
+                    video_id,
+                    platform,
+                    'fine',
+                    {'processed_indices': all_indices},
+                )
             if not clip_path:
-                self.store.update_status(video_id, platform, 'v2_fine_failed', fine_fail_reason)
+                self._complete_or_update(video_row, 'v2_fine_failed', fine_fail_reason)
+                cleanup_generated_clips = True
                 self._update_feedback(fine_fail_reason)
                 logger.info(f"Video {video_id} doesn't pass fine filter because of {fine_fail_reason}")
                 return
             self.feedback['fine_pass'] += 1
             logger.info(f"Video {video_id} passed fine filter")
 
-            self.store.update_status(video_id, platform, 'v2_passed')
+            self._complete_or_update(video_row, 'v2_passed')
+            cleanup_generated_clips = True
             if clip_path:
                 qualified_dir = Path(self.config.get('qualified_dir', './data/qualified'))
                 qualified_dir.mkdir(parents=True, exist_ok=True)
@@ -175,10 +244,158 @@ class V2ContentFilter:
 
             self.feedback['total_processed'] += 1
         finally:
-            VU.remove_videos(generated_clip_paths)
+            if cleanup_generated_clips:
+                VU.remove_videos(generated_clip_paths)
+
+    @staticmethod
+    def _has_v2_claim(video_row: Dict[str, Any]) -> bool:
+        return video_row.get('status') == VideoStatus.V2_IN_PROGRESS.value
+
+    @staticmethod
+    def _is_terminal_v2_status(status: str) -> bool:
+        return status in {
+            VideoStatus.V2_PASSED.value,
+            VideoStatus.V2_FAILED.value,
+            VideoStatus.V2_COARSE_FAILED.value,
+            VideoStatus.V2_FINE_FAILED.value,
+        }
+
+    def _checkpoint_video_dir(self, video_id: str) -> Path:
+        return self.checkpoint_dir / video_id
+
+    def _coarse_checkpoint_path(self, video_id: str) -> Path:
+        return self._checkpoint_video_dir(video_id) / 'coarse_results.json'
+
+    def _load_coarse_checkpoint(self, video_id: str, platform: str) -> Optional[Dict[str, Any]]:
+        db_checkpoint = self.store.load_checkpoint(video_id, platform, 'coarse')
+        checkpoint_file = self._coarse_checkpoint_path(video_id)
+        if db_checkpoint is None or not checkpoint_file.exists():
+            return None
+        try:
+            with checkpoint_file.open('r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data.get('clip_paths'), list):
+                logger.warning(f"Invalid coarse checkpoint payload for {platform}:{video_id}")
+                return None
+            logger.debug(f"Loaded coarse checkpoint file for {platform}:{video_id}")
+            return data
+        except Exception as e:
+            logger.warning(f"Failed to load coarse checkpoint for {platform}:{video_id}: {e}")
+            return None
+
+    def _save_coarse_checkpoint(self, video_id: str, platform: str, clip_paths: List[str]) -> None:
+        segments = getattr(self, '_last_coarse_segments', [])
+        payload = {
+            'segments': [[float(start), float(end)] for start, end in segments],
+            'clip_paths': list(clip_paths),
+        }
+        video_checkpoint_dir = self._checkpoint_video_dir(video_id)
+        video_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_file = self._coarse_checkpoint_path(video_id)
+        with checkpoint_file.open('w', encoding='utf-8') as f:
+            json.dump(payload, f)
+        self.store.save_checkpoint(video_id, platform, 'coarse', payload)
+        logger.info(f"Saved coarse checkpoint for {platform}:{video_id}")
+
+    def _cleanup_checkpoint(self, video_id: str, platform: str) -> None:
+        try:
+            self.store.delete_checkpoint(video_id, platform)
+        except Exception as e:
+            logger.warning(f"Failed to delete DB checkpoint for {platform}:{video_id}: {e}")
+        checkpoint_path = self._checkpoint_video_dir(video_id)
+        if checkpoint_path.exists():
+            shutil.rmtree(checkpoint_path, ignore_errors=True)
+            logger.info(f"Deleted checkpoint directory for {platform}:{video_id}: {checkpoint_path}")
+
+    def _begin_fine_checkpoint(
+        self,
+        video_id: str,
+        platform: str,
+        processed_indices: set,
+        remaining_indices: List[int],
+    ) -> None:
+        self._fine_checkpoint_context = {
+            'video_id': video_id,
+            'platform': platform,
+            'processed_indices': set(processed_indices),
+            'remaining_indices': list(remaining_indices),
+            'cursor': 0,
+        }
+
+    def _end_fine_checkpoint(self) -> None:
+        self._fine_checkpoint_context = None
+
+    def _mark_fine_clip_processed(self) -> None:
+        context = getattr(self, '_fine_checkpoint_context', None)
+        if not context:
+            return
+        cursor = context['cursor']
+        remaining_indices = context['remaining_indices']
+        if cursor >= len(remaining_indices):
+            return
+        context['processed_indices'].add(remaining_indices[cursor])
+        context['cursor'] = cursor + 1
+        self.store.save_checkpoint(
+            context['video_id'],
+            context['platform'],
+            'fine',
+            {'processed_indices': sorted(context['processed_indices'])},
+        )
+
+    def _complete_or_update(
+        self,
+        video_row: Dict[str, Any],
+        status: str,
+        fail_reason: Optional[str] = None
+    ):
+        video_id = video_row['video_id']
+        platform = video_row['platform']
+        updated = False
+        if self._has_v2_claim(video_row):
+            completed = self.store.complete_v2(video_id, platform, status)
+            if completed and fail_reason:
+                self.store.update_status(video_id, platform, status, fail_reason)
+                updated = True
+            elif completed:
+                updated = True
+            elif not completed:
+                logger.warning(f"Skipped V2 completion for {video_id}: claim state changed")
+        else:
+            self.store.update_status(video_id, platform, status, fail_reason)
+            updated = True
+        if updated and self._is_terminal_v2_status(status):
+            self._cleanup_checkpoint(video_id, platform)
+
+    def _fail_or_update(
+        self,
+        video_row: Dict[str, Any],
+        error: str,
+        retry_within_seconds: Optional[int] = None
+    ):
+        video_id = video_row['video_id']
+        platform = video_row['platform']
+        updated = False
+        terminal = False
+        if self._has_v2_claim(video_row):
+            updated = self.store.fail_v2(
+                video_id,
+                platform,
+                error=error,
+                retry_within_seconds=retry_within_seconds,
+            )
+            if updated:
+                row = self.store.get_video_by_id(video_id, platform)
+                terminal = bool(row and row.get('status') == VideoStatus.V2_FAILED.value)
+        else:
+            self.store.update_status(video_id, platform, 'v2_failed', error)
+            updated = True
+            terminal = True
+        if updated and terminal:
+            self._cleanup_checkpoint(video_id, platform)
 
     def _coarse_filter(self, video_path: str) -> Tuple[bool, Optional[str], List[str]]:
         segments, total_single_secs = self.yolo.detect_single_person_segments(video_path)
+        self._last_coarse_segments = segments
         total_secs = VU.get_video_secs(video_path)
         if total_secs == 0:
             return False, 'no_frames', []
@@ -197,7 +414,12 @@ class V2ContentFilter:
             return False, 'clip_failed', []
         return True, None, clip_file_paths
 
-    def _fine_filter(self, video_paths: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    def _fine_filter(
+        self,
+        video_paths: List[str],
+        video_id: str = "",
+        platform: str = ""
+    ) -> Tuple[Optional[str], Optional[str]]:
         """
         Process multiple clips in fine filtering and keep qualified clips in temporal order.
         """
@@ -210,8 +432,11 @@ class V2ContentFilter:
             try:
                 result = self._process_single_video(video_path)
                 results.append(result)
+                self._mark_fine_clip_processed()
             except Exception as e:
                 logger.error(f"fine filter single video {video_path} cause exception: {e}")
+                if getattr(self, '_fine_checkpoint_context', None):
+                    raise
                 results.append((video_path, False, None, f"exception: {str(e)}"))
 
         # Collect passed candidates from per-clip processing.
@@ -259,6 +484,7 @@ class V2ContentFilter:
         )
 
         if len(to_merge) == 1:
+            self._save_face_embeddings(video_id, platform, selected_embeddings)
             for embedding in selected_embeddings:
                 self.face_embedder.add_embedding(embedding)
             return to_merge[0], None
@@ -267,9 +493,52 @@ class V2ContentFilter:
         if merged_path is None:
             return None, "concat_failed"
 
+        self._save_face_embeddings(video_id, platform, selected_embeddings)
         for embedding in selected_embeddings:
             self.face_embedder.add_embedding(embedding)
         return merged_path, None
+
+    def _maybe_rebuild_faiss_index(self, fine_cfg: Dict[str, Any]):
+        face_db_path = fine_cfg.get('face_db_path', 'data/face_index.faiss')
+        rebuild_requested = bool(fine_cfg.get('rebuild_faiss_on_startup', False))
+        index_missing = face_db_path != ':memory:' and not os.path.exists(face_db_path)
+        if not (rebuild_requested or index_missing):
+            return
+        if not hasattr(self.face_embedder, 'index'):
+            return
+
+        project_cfg = self.config.get('project', {}) if isinstance(self.config, dict) else {}
+        video_db_path = (
+            project_cfg.get('video_db')
+            or self.config.get('video_db')
+            or getattr(self.store, 'db_path', './data/videos.db')
+        )
+        rebuild_store = VideoStore(db_path=video_db_path, max_retries=self.max_retries)
+        rebuilt_index = ArcFaceEmbedder.rebuild_from_db(
+            rebuild_store,
+            dim=getattr(self.face_embedder, 'dim', 512),
+        )
+        self.face_embedder.index = rebuilt_index
+        if hasattr(self.face_embedder, '_last_saved_ntotal'):
+            self.face_embedder._last_saved_ntotal = -1
+        logger.info(
+            f"Rebuilt FAISS index from SQLite embeddings at {video_db_path}, "
+            f"size={rebuilt_index.ntotal}"
+        )
+
+    def _save_face_embeddings(
+        self,
+        video_id: str,
+        platform: str,
+        embeddings: List[np.ndarray]
+    ) -> int:
+        if not video_id or not platform or not embeddings:
+            return 0
+        inserted = self.store.save_embeddings(video_id, platform, embeddings)
+        logger.debug(
+            f"Persisted {inserted}/{len(embeddings)} face embeddings for {platform}:{video_id}"
+        )
+        return inserted
 
     def _process_single_video(self, video_path: str) -> Tuple[
         str, bool, Optional[Tuple[float, float, np.ndarray]], Optional[str]]:

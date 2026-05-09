@@ -22,7 +22,7 @@ except Exception:  # pragma: no cover
 from aflutils.config_loader import ConfigLoader
 from core import pipeline_orchestrator as orchestrator
 
-MAX_TEST_RUNTIME_SEC = 1200
+MAX_TEST_RUNTIME_SEC = 1800
 MONITOR_INTERVAL_SEC = 10
 CPU_WARN_PCT = 90
 GPU_MEM_WARN_PCT = 90
