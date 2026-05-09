@@ -120,11 +120,6 @@ v2_filter:
       required_ratio: 0.3
       threshold: 5
     model_name: buffalo_m
-    ranking:
-      target_clip_duration: 10.0
-      weight_clarity: 0.35
-      weight_duration: 0.45
-      weight_pose: 0.2
     sampling:
       max_frames: 50
       rate: 0.1

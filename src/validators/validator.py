@@ -199,7 +199,7 @@ class V2ContentFilter:
 
     def _fine_filter(self, video_paths: List[str]) -> Tuple[Optional[str], Optional[str]]:
         """
-        Process multiple clips in fine filtering and select the best candidate.
+        Process multiple clips in fine filtering and keep qualified clips in temporal order.
         """
 
         # Collect per-clip processing output.
@@ -229,78 +229,46 @@ class V2ContentFilter:
             else:
                 fail_reasons[video_path] = fail_reason
 
-        # Rank by weighted normalized duration/clarity/pose score.
-        def normalize_values(values: List[float]) -> List[float]:
-            if not values:
-                return []
-            min_v = min(values)
-            max_v = max(values)
-            if max_v == min_v:
-                return [1.0 for _ in values]
-            span = max_v - min_v
-            return [(v - min_v) / span for v in values]
-
-        durations = [v[4] for v in passed_candidates]
-        clarities = [v[2] for v in passed_candidates]
-        poses = [v[1] for v in passed_candidates]
-        norm_durations = normalize_values(durations)
-        norm_clarities = normalize_values(clarities)
-        norm_poses = normalize_values(poses)
-
-        score_map = {}
-        ranking_cfg = self.config.get('fine', {}).get('ranking', {})
-        w_duration = ranking_cfg.get('weight_duration', 0.45)
-        w_clarity = ranking_cfg.get('weight_clarity', 0.35)
-        w_pose = ranking_cfg.get('weight_pose', 0.20)
-        for idx, candidate in enumerate(passed_candidates):
-            score_map[candidate[0]] = (
-                    w_duration * norm_durations[idx]
-                    + w_clarity * norm_clarities[idx]
-                    + w_pose * norm_poses[idx]
-            )
-
-        def score(v):
-            return score_map[v[0]]
-
-        passed_candidates.sort(key=score, reverse=True)
-
-        # Ordered dedup and final candidate list.
+        # Dedup in temporal order. The first occurrence is kept, and later
+        # duplicate clips are skipped before embeddings are persisted.
         passed_videos = []
+        already_selected_embeddings = []
         for video_path, pose_ratio, clarity_ratio, embedding, duration_secs in passed_candidates:
             if self.face_embedder.is_duplicate(embedding, self.dedup_threshold):
                 fail_reasons[video_path] = 'duplicate'
                 continue
+            is_local_duplicate = any(
+                np.linalg.norm(embedding - selected) < self.dedup_threshold
+                for selected in already_selected_embeddings
+            )
+            if is_local_duplicate:
+                fail_reasons[video_path] = 'duplicate'
+                continue
             passed_videos.append((video_path, pose_ratio, clarity_ratio, embedding, duration_secs))
+            already_selected_embeddings.append(embedding)
 
         if not passed_videos:
             all_fail_reasons = '|'.join(fail_reasons.values())
             return None, all_fail_reasons
 
-        best_video_path, best_pose, best_clarity, best_embedding, best_duration = passed_videos[0]
+        to_merge = [video_path for video_path, _, _, _, _ in passed_videos]
+        selected_embeddings = [embedding for _, _, _, embedding, _ in passed_videos]
+        total_duration = sum(duration_secs for _, _, _, _, duration_secs in passed_videos)
+        logger.info(
+            f"Fine filter selected {len(passed_videos)} clips, total duration {total_duration:.2f}s"
+        )
 
-        target_duration = ranking_cfg.get('target_clip_duration', 30.0)
-        video_duration = best_duration
-        if video_duration >= target_duration:
-            self.face_embedder.add_embedding(best_embedding)
-            return best_video_path, None
-
-        to_merge = [best_video_path]
-        total_duration = video_duration
-        for video_path, _, _, _, dur in passed_videos[1:]:
-            to_merge.append(video_path)
-            total_duration += dur
-            if total_duration >= target_duration:
-                break
-
-        if total_duration < target_duration:
-            fail_msg = f"insufficient_duration: total {total_duration:.2f}s < {target_duration}s"
-            return None, fail_msg
+        if len(to_merge) == 1:
+            for embedding in selected_embeddings:
+                self.face_embedder.add_embedding(embedding)
+            return to_merge[0], None
 
         merged_path = VU.concat_videos(to_merge)
         if merged_path is None:
             return None, "concat_failed"
 
-        self.face_embedder.add_embedding(best_embedding)
+        for embedding in selected_embeddings:
+            self.face_embedder.add_embedding(embedding)
         return merged_path, None
 
     def _process_single_video(self, video_path: str) -> Tuple[

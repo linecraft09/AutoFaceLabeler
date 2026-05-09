@@ -141,11 +141,6 @@ v2_filter:
     sampling:
       rate: 0.1
       max_frames: 200
-    ranking:
-      weight_duration: 0.45
-      weight_clarity: 0.35
-      weight_pose: 0.20
-      target_clip_duration: 30.0
     batch_size: 16
     face_detection:
       model_path: models/insightface/scrfd_320_batched/scrfd_10g_320_batch.onnx
