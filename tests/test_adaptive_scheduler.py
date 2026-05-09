@@ -123,7 +123,8 @@ class TestAdaptiveScheduler(unittest.TestCase):
                 "weight_decay_factor": 0.9,
             },
             "llm": {"enabled": False},
-            "json_file": None,
+            "project": {"explorer_state": None},
+            "pipeline": {"target_qualified": 200},
         }
         self.scheduler = AdaptiveScheduler(self.config)
 

@@ -27,15 +27,18 @@ class YtDlpSearchApi(SearchApi):
     """基于 yt-dlp 的搜索实现 (支持 YouTube 和 BiliBili)，采用混合策略获取分辨率"""
 
     def __init__(self, platform: str, proxy: str = None, user_agent: str = None,
-                 video_store: Optional[VideoStore] = None):
+                 video_store: Optional[VideoStore] = None, search_config: Optional[dict] = None):
         """
         :param platform: 'youtube' 或 'bilibili'
         """
         self.platform = platform.lower()
         self.video_store = video_store
+        self.search_config = search_config or {}
         if self.platform not in ['youtube', 'bilibili']:
             raise ValueError("platform must be 'youtube' or 'bilibili'")
 
+        fast_cfg = self.search_config.get('fast_search', {})
+        detail_cfg = self.search_config.get('detail_fetch', {})
         # 基础配置（用于快速搜索，extract_flat=True）
         self.ydl_opts_fast = {
             'quiet': True,
@@ -49,15 +52,18 @@ class YtDlpSearchApi(SearchApi):
                 'Accept-Language': 'en-US,en;q=0.9',
                 'Accept-Encoding': 'gzip, deflate, br, zstd',
             },
-            'sleep_interval': random.uniform(3, 6),
-            'max_sleep_interval': 10,
+            'sleep_interval': random.uniform(
+                fast_cfg.get('sleep_interval_min', 3),
+                fast_cfg.get('sleep_interval_max', 6),
+            ),
+            'max_sleep_interval': fast_cfg.get('max_sleep_interval', 10),
             'sleep_interval_requests': random.uniform(2, 5),
             # 'cookiefile': 'cookies.txt',  # 取消注释并设置路径以使用 cookie
             'nocheckcertificate': False,
             'prefer_insecure': False,
-            'extractor_retries': 3,
-            'file_access_retries': 3,
-            "socket_timeout": 30
+            'extractor_retries': fast_cfg.get('extractor_retries', 3),
+            'file_access_retries': fast_cfg.get('file_access_retries', 3),
+            "socket_timeout": fast_cfg.get('socket_timeout', 30),
         }
         if proxy:
             self.ydl_opts_fast['proxy'] = proxy
@@ -69,7 +75,7 @@ class YtDlpSearchApi(SearchApi):
         self.ydl_opts_detail['extract_flat'] = False
         self.ydl_opts_detail['cookiefile'] = None
         # 详细模式可能需要更长的超时
-        self.ydl_opts_detail['socket_timeout'] = 60
+        self.ydl_opts_detail['socket_timeout'] = detail_cfg.get('socket_timeout', 60)
 
     def get_platform(self) -> str:
         return self.platform
@@ -109,6 +115,14 @@ class YtDlpSearchApi(SearchApi):
                 return []
             except Exception as e:
                 logger.error(f"Unexpected fast search failure for query '{query}': {e}", exc_info=True)
+                raise
+            except BaseException as e:
+                if isinstance(e, SystemExit):
+                    logger.warning(
+                        f"yt-dlp exited during fast search for query '{query}' "
+                        f"(SystemExit code: {e.code!r})"
+                    )
+                    return []
                 raise
         logger.info(f"Search for {query} on {self.platform} receive {len(entries)} video infos")
 
@@ -152,7 +166,7 @@ class YtDlpSearchApi(SearchApi):
 
         details_by_url = {}
         if entry_with_urls:
-            with ThreadPoolExecutor(max_workers=5) as executor:
+            with ThreadPoolExecutor(max_workers=self.search_config.get('detail_workers', 5)) as executor:
                 future_to_url = {
                     executor.submit(self._get_video_details, video_url): video_url
                     for _, video_url in entry_with_urls
@@ -164,6 +178,15 @@ class YtDlpSearchApi(SearchApi):
                     except Exception as e:
                         logger.error(f"Failed to get details for {video_url}: {e}")
                         details_by_url[video_url] = None
+                    except BaseException as e:
+                        if isinstance(e, SystemExit):
+                            logger.warning(
+                                f"yt-dlp exited while fetching details for {video_url} "
+                                f"(SystemExit code: {e.code!r})"
+                            )
+                            details_by_url[video_url] = None
+                            continue
+                        raise
 
         for entry, video_url in entry_with_urls:
             # 获取详细信息
@@ -215,6 +238,14 @@ class YtDlpSearchApi(SearchApi):
             except Exception as e:
                 logger.error(f"Unexpected error getting details for {url}: {e}", exc_info=True)
                 return None
+            except BaseException as e:
+                if isinstance(e, SystemExit):
+                    logger.warning(
+                        f"yt-dlp exited while fetching details for {url} "
+                        f"(SystemExit code: {e.code!r})"
+                    )
+                    return None
+                raise
 
     @staticmethod
     def _classify_ytdlp_error(exc: Exception) -> str:

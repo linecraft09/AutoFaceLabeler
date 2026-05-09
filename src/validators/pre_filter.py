@@ -24,14 +24,13 @@ class PreFilter:
             'tags_whitelist': [...]   # 可选
         }
         """
-        self.filters = config.get('filters', {})
-        self.min_dur = self.filters.get('min_duration', 30)
-        self.max_dur = self.filters.get('max_duration', 1800)
-        self.min_res = self.filters.get('min_resolution', 720)
-        self.title_blacklist = [re.compile(pat, re.IGNORECASE) for pat in self.filters.get('title_blacklist', [])]
-        self.channel_blacklist = [re.compile(pat, re.IGNORECASE) for pat in self.filters.get('channel_blacklist', [])]
-        self.min_views = self.filters.get('min_views', 0)
-        self.tags_whitelist = [tag.lower() for tag in self.filters.get('tags_whitelist', [])]
+        self.min_dur = config.get('min_duration', 30)
+        self.max_dur = config.get('max_duration', 1800)
+        self.min_res = config.get('min_resolution', 720)
+        self.title_blacklist = [re.compile(pat, re.IGNORECASE) for pat in config.get('title_blacklist', [])]
+        self.channel_blacklist = [re.compile(pat, re.IGNORECASE) for pat in config.get('channel_blacklist', [])]
+        self.min_views = config.get('min_views', 0)
+        self.tags_whitelist = [tag.lower() for tag in config.get('tags_whitelist', [])]
 
     def filter(self, videos: List[VideoMeta], search_term: str) -> Tuple[List[VideoMeta], Dict[str, Any]]:
         """

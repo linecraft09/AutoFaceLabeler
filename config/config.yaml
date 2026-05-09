@@ -1,3 +1,51 @@
+# === Project Paths ===
+project:
+  data_dir: './data'
+  video_db: './data/videos.db'
+  explorer_state: './data/explorer.json'
+  logs_dir: './logs'
+
+# === Search & Discovery ===
+search:
+  platforms: ['youtube', 'bilibili']
+  per_platform_results: 20
+  detail_workers: 5
+  fast_search:
+    socket_timeout: 30
+    extractor_retries: 3
+    file_access_retries: 3
+    sleep_interval_min: 3
+    sleep_interval_max: 6
+    max_sleep_interval: 10
+  detail_fetch:
+    socket_timeout: 60
+
+# === Download ===
+download:
+  format: 'bestvideo[height>=720]+bestaudio/best'
+  merge_output_format: 'mkv'
+  concurrent_fragments: 5
+  retries: 10
+  fragment_retries: 10
+  continue_dl: true
+  sleep_interval: 5
+  max_sleep_interval: 15
+  user_agent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  outtmpl: './data/raw/%(id)s/%(title)s [%(id)s].%(ext)s'
+  nooverwrites: true
+  restrictfilenames: true
+  ignoreerrors: true
+
+# === Pipeline Orchestrator ===
+pipeline:
+  target_qualified: 200
+  batch_size: 10
+  max_retries: 3
+  pending_ratio_threshold: 0.5
+  pending_wait_seconds: 60
+  auto_cleanup_stale: true
+
+# === Explorer & Scheduling ===
 explorer:
   initial_search_terms:
     # ========== 访谈类 (interview) ==========
@@ -8,7 +56,6 @@ explorer:
     - { text: "talk show", platform: youtube, category: interview, weight: 0.9 }
     - { text: "Q&A", platform: youtube, category: interview, weight: 0.8 }
     - { text: "podcast solo", platform: youtube, category: interview, weight: 0.8 }
-
     # ========== 教育类 (educational) ==========
     - { text: "tutorial", platform: youtube, category: educational, weight: 1.0 }
     - { text: "how to", platform: youtube, category: educational, weight: 0.9 }
@@ -17,7 +64,6 @@ explorer:
     - { text: "科普讲解", platform: bilibili, category: educational, weight: 1.0 }
     - { text: "知识分享", platform: bilibili, category: educational, weight: 0.9 }
     - { text: "公开课", platform: bilibili, category: educational, weight: 0.8 }
-
     # ========== Vlog类 (vlog) ==========
     - { text: "vlog", platform: youtube, category: vlog, weight: 1.0 }
     - { text: "daily vlog", platform: youtube, category: vlog, weight: 0.9 }
@@ -26,7 +72,6 @@ explorer:
     - { text: "日常Vlog", platform: bilibili, category: vlog, weight: 1.0 }
     - { text: "独居日常", platform: bilibili, category: vlog, weight: 0.9 }
     - { text: "生活记录", platform: bilibili, category: vlog, weight: 0.8 }
-
     # ========== 美妆/穿搭类 (beauty) ==========
     - { text: "makeup tutorial", platform: youtube, category: beauty, weight: 1.0 }
     - { text: "skincare routine", platform: youtube, category: beauty, weight: 0.9 }
@@ -34,7 +79,6 @@ explorer:
     - { text: "美妆教程", platform: bilibili, category: beauty, weight: 1.0 }
     - { text: "穿搭分享", platform: bilibili, category: beauty, weight: 0.9 }
     - { text: "护肤分享", platform: bilibili, category: beauty, weight: 0.8 }
-
     # ========== 评测/解说类 (review) ==========
     - { text: "product review", platform: youtube, category: review, weight: 1.0 }
     - { text: "unboxing", platform: youtube, category: review, weight: 0.9 }
@@ -47,44 +91,61 @@ explorer:
     model: "deepseek-chat"
     api_key_env: "OPENAI_API_KEY"
     base_url: "https://api.deepseek.com"
-    optimization_trigger_v2_pass_rate: 0.05   # 合格率低于5%触发
+    temperature: 0.7
+    optimization_trigger_v2_pass_rate: 0.02
+    optimization_trigger_v1_pass_rate: 0.10
   sampling:
-    target_distribution: # 目标各类型占比（保持原样）
+    target_distribution:
       interview: 0.25
       educational: 0.25
       vlog: 0.20
       beauty: 0.15
       review: 0.15
     min_weight: 0.1
-    weight_decay_factor: 0.9       # 每次反馈后未使用的词权重衰减
-  json_file: "./data/explorer.json"
-orchestrator:
-  target_qualified: 200
+    weight_decay_factor: 0.9
 
-validator1:
-  filters:
-    min_duration: 30
-    max_duration: 1800
-    min_resolution: 720
-    title_blacklist: [ "reaction", "multi", "多人", "合集", "replay" ]
-    channel_blacklist: [ "GameGrub", "群访" ]
-    min_views: 1000
+# === V1 Pre-filter ===
+v1_filter:
+  min_duration: 30
+  max_duration: 1800
+  min_resolution: 720
+  min_views: 1000
+  title_blacklist: ["reaction", "multi", "多人", "合集", "replay"]
+  channel_blacklist: ["GameGrub", "群访"]
+  tags_whitelist: []
 
-validator2:
-  coarse_filter:
+# === V2 Content Filter ===
+v2_filter:
+  device: 'cuda'
+  qualified_dir: './data/qualified'
+  pending_limit: 5
+  poll_interval_seconds: 5
+  coarse:
+    model_path: 'yolo11n.pt'
+    batch_size: 16
     single_person_threshold: 0.8
     audio_required: true
-    model_path: 'yolo11n.pt'
-    device: 'cuda'
-  fine_filter:
-    head_pose_max_angle: 15
-    head_pose_required_ratio: 0.8
-    laplacian_threshold: 20
-    laplacian_required_ratio: 0.8
-    dedup_threshold: 0.8
-    pose_model: '6drepnet'
-    device: 'cuda'
-    speech_required: true          # 是否检测人声
+  fine:
+    model_name: 'buffalo_m'
     face_db_path: './data/face_index.faiss'
-  qualified_dir: './data/qualified'
-
+    dedup_threshold: 0.75
+    speech_required: true
+    head_pose:
+      max_angle: 10
+      required_ratio: 0.8
+    laplacian:
+      threshold: 100
+      required_ratio: 0.8
+    sampling:
+      rate: 0.1
+      max_frames: 200
+    ranking:
+      weight_duration: 0.45
+      weight_clarity: 0.35
+      weight_pose: 0.20
+      target_clip_duration: 30.0
+    batch_size: 16
+    face_detection:
+      model_path: models/insightface/scrfd_320_batched/scrfd_10g_320_batch.onnx
+      det_thresh: 0.5
+      det_size: [320, 320]

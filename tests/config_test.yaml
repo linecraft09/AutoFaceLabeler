@@ -1,51 +1,116 @@
-# Integration test config — minimal scope, exercise all pipeline stages
-# Data paths use /tmp to avoid polluting the repo
+download:
+  concurrent_fragments: 2
+  continue_dl: true
+  format: bestvideo+bestaudio/best
+  fragment_retries: 2
+  ignoreerrors: true
+  max_sleep_interval: 2
+  merge_output_format: mkv
+  nooverwrites: true
+  outtmpl: /tmp/afl_raw/%(id)s/%(title)s [%(id)s].%(ext)s
+  restrictfilenames: true
+  retries: 2
+  sleep_interval: 1
+  user_agent: Mozilla/5.0
 explorer:
   initial_search_terms:
-    - { text: "tutorial", platform: youtube, category: educational, weight: 1.0 }
-    - { text: "vlog", platform: youtube, category: vlog, weight: 1.0 }
-    - { text: "科普讲解", platform: bilibili, category: educational, weight: 1.0 }
+  - category: interview
+    platform: bilibili
+    text: 人物访谈
+    weight: 1.0
+  - category: vlog
+    platform: bilibili
+    text: vlog
+    weight: 1.0
+  - category: vlog
+    platform: bilibili
+    text: 自我介绍
+    weight: 1.0
+  - category: educational
+    platform: bilibili
+    text: 教程
+    weight: 1.0
   llm:
+    api_key_env: OPENAI_API_KEY
+    base_url: https://api.deepseek.com
     enabled: false
-    model: "deepseek-chat"
-    api_key_env: "OPENAI_API_KEY"
-    base_url: "https://api.deepseek.com"
+    model: deepseek-chat
+    optimization_trigger_v1_pass_rate: 0.1
     optimization_trigger_v2_pass_rate: 0.05
   sampling:
-    target_distribution:
-      interview: 0.33
-      educational: 0.34
-      vlog: 0.33
     min_weight: 0.1
+    target_distribution:
+      educational: 0.34
+      interview: 0.33
+      vlog: 0.33
     weight_decay_factor: 0.9
-  json_file: "/tmp/afl_explorer_test.json"
-
-orchestrator:
+pipeline:
+  auto_cleanup_stale: true
+  batch_size: 5
+  max_retries: 2
+  pending_ratio_threshold: 0.5
+  pending_wait_seconds: 5
   target_qualified: 1
-
-validator1:
-  filters:
-    min_duration: 10
-    max_duration: 1800
-    min_resolution: 360
-    title_blacklist: ["reaction", "multi", "多人", "合集", "replay"]
-    channel_blacklist: ["GameGrub", "群访"]
-    min_views: 0
-
-validator2:
-  coarse_filter:
-    single_person_threshold: 0.15   # Very low for testing — most real videos fail at 0.5
-    audio_required: false           # Many short clips lack audio
-    model_path: 'yolo11n.pt'
-    device: 'cuda'
-  fine_filter:
-    head_pose_max_angle: 45         # Relaxed for test
-    head_pose_required_ratio: 0.3   # Relaxed
-    laplacian_threshold: 5          # Relaxed
-    laplacian_required_ratio: 0.3   # Relaxed
-    dedup_threshold: 0.99           # Very loose — accept near duplicates in test
-    pose_model: '6drepnet'
-    device: 'cuda'
+project:
+  data_dir: /tmp/afl_data_test
+  explorer_state: /tmp/afl_explorer_test.json
+  logs_dir: /tmp/afl_logs_test
+  video_db: /tmp/afl_videos_test.db
+search:
+  detail_fetch:
+    socket_timeout: 30
+  detail_workers: 2
+  fast_search:
+    extractor_retries: 2
+    file_access_retries: 2
+    max_sleep_interval: 3
+    sleep_interval_max: 2
+    sleep_interval_min: 1
+    socket_timeout: 20
+  per_platform_results: 5
+  platforms:
+  - bilibili
+v1_filter:
+  channel_blacklist:
+  - GameGrub
+  - 群访
+  max_duration: 1800
+  min_duration: 10
+  min_resolution: 360
+  min_views: 0
+  tags_whitelist: []
+  title_blacklist:
+  - reaction
+  - multi
+  - 多人
+  - 合集
+  - replay
+v2_filter:
+  coarse:
+    audio_required: false
+    batch_size: 4
+    model_path: yolo11n.pt
+    single_person_threshold: 0.15
+  device: cuda
+  fine:
+    dedup_threshold: 0.99
+    face_db_path: /tmp/afl_test_faces.faiss
+    head_pose:
+      max_angle: 45
+      required_ratio: 0.3
+    laplacian:
+      required_ratio: 0.3
+      threshold: 5
+    model_name: buffalo_m
+    ranking:
+      target_clip_duration: 10.0
+      weight_clarity: 0.35
+      weight_duration: 0.45
+      weight_pose: 0.2
+    sampling:
+      max_frames: 50
+      rate: 0.1
     speech_required: false
-    face_db_path: '/tmp/afl_test_faces.faiss'
-  qualified_dir: '/tmp/afl_qualified_test'
+  pending_limit: 2
+  poll_interval_seconds: 1
+  qualified_dir: /tmp/afl_qualified_test

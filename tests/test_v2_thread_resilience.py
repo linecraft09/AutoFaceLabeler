@@ -59,9 +59,9 @@ class TestV2FilterThreadResilience:
         monkeypatch.setattr(V2ContentFilter, '_process_video', _process_video_patch)
 
         config = {
-            'coarse_filter': {'model_path': 'yolo11n.pt', 'device': 'cpu',
+            'coarse': {'model_path': 'yolo11n.pt', 'device': 'cpu',
                               'single_person_threshold': 0.8, 'audio_required': False},
-            'fine_filter': {'device': 'cpu', 'face_db_path': '/tmp/test_faiss.faiss'},
+            'fine': {'device': 'cpu', 'face_db_path': '/tmp/test_faiss.faiss'},
             'qualified_dir': '/tmp/qual_test',
         }
 
@@ -94,9 +94,9 @@ class TestV2FilterThreadResilience:
                 file_path=f"/nonexistent/v{i}.mp4")
 
         config = {
-            'coarse_filter': {'model_path': 'yolo11n.pt', 'device': 'cpu',
+            'coarse': {'model_path': 'yolo11n.pt', 'device': 'cpu',
                               'single_person_threshold': 0.8, 'audio_required': False},
-            'fine_filter': {'device': 'cpu', 'face_db_path': '/tmp/test_faiss2.faiss'},
+            'fine': {'device': 'cpu', 'face_db_path': '/tmp/test_faiss2.faiss'},
             'qualified_dir': '/tmp/qual_test2',
         }
 

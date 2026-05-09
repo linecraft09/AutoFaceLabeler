@@ -1,12 +1,15 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import List, Tuple, Optional
 
 import cv2
+import numpy as np
 
 from aflutils.logger import get_logger
 
@@ -32,10 +35,51 @@ FFPROBE = _find_ffprobe()
 logger = get_logger(__name__)
 
 
+def get_cuda_lib_path() -> str:
+    """Build an LD_LIBRARY_PATH that exposes conda CUDA libs and WSL libcuda."""
+    paths = []
+
+    paths.append("/usr/lib/wsl/lib")
+
+    prefixes = [os.environ.get("CONDA_PREFIX"), sys.prefix]
+    for prefix in [p for p in prefixes if p]:
+        python_versions = ("3.10", "3.11", "3.12", f"{sys.version_info.major}.{sys.version_info.minor}")
+        for python_version in python_versions:
+            nvidia_root = Path(prefix) / f"lib/python{python_version}/site-packages/nvidia"
+            if not nvidia_root.is_dir():
+                continue
+            for candidate in sorted(nvidia_root.glob("*/lib")):
+                if candidate.is_dir():
+                    paths.append(str(candidate))
+
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    if current:
+        paths.extend(path for path in current.split(":") if path)
+
+    deduped = []
+    seen = set()
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        deduped.append(path)
+    return ":".join(deduped)
+
+
+def _build_cuda_env() -> dict:
+    return {**os.environ, "LD_LIBRARY_PATH": get_cuda_lib_path()}
+
+
 def _check_ffmpeg_cuda_support() -> bool:
     """Check if the ffmpeg binary supports CUDA/NVENC."""
     try:
-        result = subprocess.run([FFMPEG, "-encoders"], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            [FFMPEG, "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_build_cuda_env(),
+        )
         return 'nvenc' in result.stdout or 'cuda' in result.stdout
     except Exception:
         return False
@@ -67,7 +111,13 @@ def sample_video_per_sec(input_path: str, suffix: str = "_sample", output_ext: s
 
     try:
         # 检查 ffmpeg 是否可用
-        subprocess.run([FFMPEG, "-version"], capture_output=True, check=True, timeout=10)
+        subprocess.run(
+            [FFMPEG, "-version"],
+            capture_output=True,
+            check=True,
+            timeout=10,
+            env=_build_cuda_env(),
+        )
     except (subprocess.SubprocessError, FileNotFoundError):
         raise FileNotFoundError("未找到 ffmpeg，请确保已安装并加入 PATH")
 
@@ -97,7 +147,7 @@ def sample_video_per_sec(input_path: str, suffix: str = "_sample", output_ext: s
         ]
 
     # 执行抽取和合并
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=_build_cuda_env())
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg 执行失败 (返回码 {result.returncode}):\n{result.stderr}")
 
@@ -131,6 +181,75 @@ def get_video_secs(video_path: str) -> float:
         logger.warning(f"Invalid FPS ({fps}) for {video_path}, returning 0.0 seconds")
         return 0.0
     return total_frames / fps
+
+
+def read_sampled_frames(video_path: str, indices: List[int]) -> Tuple[List[np.ndarray], dict]:
+    """
+    Read only the requested frame indices using seek, with sequential-read fallback.
+
+    Args:
+        video_path: Path to the video file.
+        indices: Frame indices to read. Returned frames follow this order.
+
+    Returns:
+        (frames, meta), where meta contains total_frames, fps, width, and height.
+    """
+    requested = [int(idx) for idx in indices]
+    cap = cv2.VideoCapture(video_path)
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {video_path}")
+
+        meta = {
+            "total_frames": int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+            "fps": float(cap.get(cv2.CAP_PROP_FPS)),
+            "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        }
+        if not requested:
+            return [], meta
+
+        frames_by_index = {}
+        seek_failed = False
+        for idx in sorted(set(requested)):
+            if idx < 0 or idx >= meta["total_frames"]:
+                seek_failed = True
+                break
+            if not cap.set(cv2.CAP_PROP_POS_FRAMES, idx):
+                seek_failed = True
+                break
+            ok, frame = cap.read()
+            actual_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            if not ok or actual_idx != idx:
+                seek_failed = True
+                break
+            frames_by_index[idx] = frame
+
+        if seek_failed:
+            logger.warning(f"Frame seek validation failed for {video_path}; falling back to sequential read")
+            return _read_sampled_frames_sequential(video_path, requested, meta)
+
+        return [frames_by_index[idx] for idx in requested if idx in frames_by_index], meta
+    finally:
+        cap.release()
+
+
+def _read_sampled_frames_sequential(video_path: str, indices: List[int], meta: dict) -> Tuple[List[np.ndarray], dict]:
+    wanted = set(indices)
+    frames_by_index = {}
+    cap = cv2.VideoCapture(video_path)
+    try:
+        frame_idx = 0
+        while cap.isOpened() and len(frames_by_index) < len(wanted):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame_idx in wanted:
+                frames_by_index[frame_idx] = frame
+            frame_idx += 1
+    finally:
+        cap.release()
+    return [frames_by_index[idx] for idx in indices if idx in frames_by_index], meta
 
 
 def clip_video(video_path: str, segments: List[Tuple], unit: str = "frame", max_workers: int = None) -> List[str]:
@@ -271,7 +390,7 @@ def _clip_with_cuda(video_path: str, start: float, end: float, output: str) -> b
         "-y"
     ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, env=_build_cuda_env())
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"CUDA clipping error: {e.stderr}")
@@ -298,7 +417,7 @@ def _clip_with_software(video_path: str, start: float, end: float, output: str) 
         output, "-y"
     ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, env=_build_cuda_env())
         return True
     except subprocess.CalledProcessError as e:
         logger.error(f"Software clipping error: {e.stderr}")
@@ -463,7 +582,7 @@ def check_audio(video_path: str) -> bool:
 def extract_audio(audio_path: str, video_path: str):
     cmd = [FFMPEG, '-hwaccel', 'cuda', '-i', video_path, '-ac', '1', '-ar',
            '16000', '-y', audio_path]
-    subprocess.run(cmd, capture_output=True, check=True)
+    subprocess.run(cmd, capture_output=True, check=True, env=_build_cuda_env())
 
 
 def concat_videos(video_paths: List[str]) -> Optional[str]:
@@ -511,7 +630,7 @@ def _concat_with_copy(video_paths: List[str], output_path: str) -> bool:
             "-c", "copy",
             output_path, "-y"
         ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, env=_build_cuda_env())
         return True
     except subprocess.CalledProcessError:
         # 流复制失败（如编码/尺寸不一致），删除可能产生的半成品
@@ -540,7 +659,7 @@ def _concat_with_reencode(video_paths: List[str], output_path: str) -> bool:
             "-movflags", "+faststart",
             output_path, "-y"
         ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True, env=_build_cuda_env())
         return True
     except subprocess.CalledProcessError:
         if os.path.exists(output_path):
