@@ -1,10 +1,16 @@
 download:
-  concurrent_fragments: 2
+  concurrent_fragments: 1
   continue_dl: true
-  format: best[height<=720]
+  format: bv*[height<=720]+ba/b[height<=720]/best[height<=720]/best
   fragment_retries: 2
-  ignoreerrors: true
+  ignoreerrors: false
   max_sleep_interval: 2
+  max_attempts: 2
+  backoff:
+    initial_seconds: 2
+    max_seconds: 8
+    multiplier: 2
+    jitter_seconds: 0
   merge_output_format: mkv
   nooverwrites: true
   outtmpl: /tmp/afl_raw/%(id)s/%(title)s [%(id)s].%(ext)s
@@ -20,34 +26,9 @@ download:
   proxy: http://127.0.0.1:7890
 explorer:
   initial_search_terms:
-  - category: interview
-    platform: bilibili
-    text: 人物访谈
-    weight: 1.0
   - category: vlog
     platform: bilibili
     text: vlog
-    weight: 1.0
-  - category: vlog
-    platform: bilibili
-    text: 自我介绍
-    weight: 1.0
-  - category: educational
-    platform: bilibili
-    text: 教程
-    weight: 1.0
-  # YouTube 搜索词
-  - category: vlog
-    platform: youtube
-    text: short vlog
-    weight: 1.0
-  - category: interview
-    platform: youtube
-    text: short interview
-    weight: 1.0
-  - category: educational
-    platform: youtube
-    text: tutorial short
     weight: 1.0
   llm:
     api_key_env: OPENAI_API_KEY
@@ -65,7 +46,8 @@ explorer:
     weight_decay_factor: 0.9
 pipeline:
   auto_cleanup_stale: true
-  batch_size: 5
+  batch_size: 1
+  enable_v2: false
   max_retries: 2
   pending_ratio_threshold: 0.5
   pending_wait_seconds: 5
@@ -76,17 +58,32 @@ project:
   logs_dir: /tmp/afl_logs_test
   video_db: /tmp/afl_videos_test.db
 search:
-  detail_fetch:
-    socket_timeout: 30
-  detail_workers: 2
+  detail_workers: 1
+  enabled_platforms:
+  - bilibili
+  cookie_fallback_on_anti_bot: true
   fast_search:
     extractor_retries: 2
     file_access_retries: 2
     max_sleep_interval: 3
+    max_attempts: 2
+    backoff:
+      initial_seconds: 2
+      max_seconds: 8
+      multiplier: 2
+      jitter_seconds: 0
     sleep_interval_max: 2
     sleep_interval_min: 1
     socket_timeout: 20
-  per_platform_results: 5
+  detail_fetch:
+    socket_timeout: 30
+    max_attempts: 2
+    backoff:
+      initial_seconds: 2
+      max_seconds: 8
+      multiplier: 2
+      jitter_seconds: 0
+  per_platform_results: 2
   platforms:
     youtube:
       cookies: config/youtube_cookies.txt

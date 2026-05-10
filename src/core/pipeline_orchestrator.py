@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import uuid
+from pathlib import Path
 
 from aflutils.logger import get_logger
 from core.storage.video_store import VideoStore
@@ -28,7 +29,7 @@ def _load_config_loader():
     return ConfigLoader
 
 
-def _load_pipeline_components():
+def _load_pipeline_components(enable_v2=True):
     """Lazy-load heavy pipeline dependencies so restart tests can monkeypatch them."""
     global DefaultDownloader
     global AdaptiveScheduler
@@ -48,7 +49,7 @@ def _load_pipeline_components():
     if PreFilter is None:
         from validators.pre_filter import PreFilter as pre_filter_cls
         PreFilter = pre_filter_cls
-    if V2ContentFilter is None:
+    if enable_v2 and V2ContentFilter is None:
         from validators.validator import V2ContentFilter as v2_filter_cls
         V2ContentFilter = v2_filter_cls
 
@@ -59,6 +60,10 @@ def _remove_videos(paths):
         import aflutils.video_utils as video_utils
         VU = video_utils
     VU.remove_videos(paths)
+
+
+def _is_downloaded_file_path(file_path) -> bool:
+    return bool(file_path) and Path(str(file_path)).is_file()
 
 
 def _normalize_resume_stage(stage):
@@ -85,6 +90,26 @@ def _advance_pipeline_stage(video_store, run_id, stage_name):
     next_stage = NEXT_PIPELINE_STAGE.get(stage_name)
     if next_stage:
         video_store.update_pipeline_run_stage(run_id, next_stage)
+
+
+def _enabled_search_platforms(search_cfg: dict) -> list:
+    known_platforms = ("youtube", "bilibili")
+    explicit = search_cfg.get("enabled_platforms")
+    if explicit is not None:
+        requested = [explicit] if isinstance(explicit, str) else list(explicit)
+        enabled = []
+        for platform in requested:
+            normalized = str(platform).lower()
+            if normalized in known_platforms and normalized not in enabled:
+                enabled.append(normalized)
+        return enabled
+
+    platform_cfg = search_cfg.get("platforms", {})
+    return [
+        platform
+        for platform in known_platforms
+        if platform_cfg.get(platform, {}).get("enabled", True) is not False
+    ]
 
 
 def _is_transient_error(exc: Exception) -> bool:
@@ -170,10 +195,13 @@ def run_pipeline(config=None):
     completed = False
 
     try:
-        _load_pipeline_components()
+        pipeline_cfg = config.get('pipeline', {})
+        enable_v2 = pipeline_cfg.get('enable_v2', True)
+
+        _load_pipeline_components(enable_v2=enable_v2)
 
         explorer_cfg = config.get('explorer', {})
-        explorer_cfg['pipeline'] = config.get('pipeline', {})
+        explorer_cfg['pipeline'] = pipeline_cfg
         explorer_cfg['project'] = config.get('project', {})
         explorer = AdaptiveScheduler(explorer_cfg)
         v1 = PreFilter(config.get('v1_filter', {})) if not _skip_stage(resume_stage, "v1") else None
@@ -186,22 +214,35 @@ def run_pipeline(config=None):
         # 尝试从环境变量获取代理（.env 或系统环境变量）
         proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY') or None
 
-        yt_searcher = None
-        bl_searcher = None
+        enabled_platforms = _enabled_search_platforms(search_cfg)
+        logger.info(f"Enabled search platforms: {enabled_platforms}")
+        searchers = {}
         if not _skip_stage(resume_stage, "search"):
-            yt_searcher = YtDlpSearchApi(
-                platform='youtube', proxy=proxy, video_store=video_store,
-                search_config=search_cfg
-            )
-            bl_searcher = YtDlpSearchApi(
-                platform='bilibili', proxy=proxy, video_store=video_store,
-                search_config=search_cfg
-            )
+            for platform in enabled_platforms:
+                searchers[platform] = YtDlpSearchApi(
+                    platform=platform, proxy=proxy, video_store=video_store,
+                    search_config=search_cfg
+                )
+
+        def ensure_stage_components():
+            nonlocal v1, downloader, searchers
+
+            if v1 is None:
+                v1 = PreFilter(config.get('v1_filter', {}))
+            if downloader is None:
+                downloader = DefaultDownloader(config_dict=config.get('download', {}))
+            for platform in enabled_platforms:
+                if platform not in searchers:
+                    searchers[platform] = YtDlpSearchApi(
+                        platform=platform, proxy=proxy, video_store=video_store,
+                        search_config=search_cfg
+                    )
 
         # 初始化 V2，实际启动延后到 v1 阶段之后，便于按阶段恢复。
-        v2_config = dict(config.get('v2_filter', {}))
-        v2_config['project'] = config.get('project', {})
-        v2_filter = V2ContentFilter(v2_config, video_store, explorer)
+        if enable_v2:
+            v2_config = dict(config.get('v2_filter', {}))
+            v2_config['project'] = config.get('project', {})
+            v2_filter = V2ContentFilter(v2_config, video_store, explorer)
         v2_started = False
         loop_retry_attempt = 0
 
@@ -209,10 +250,13 @@ def run_pipeline(config=None):
             try:
                 stats = video_store.get_statistics()
                 logger.info(f"Storage stats: {stats}")
-                pipeline_cfg = config.get('pipeline', {})
                 pending_ratio_threshold = pipeline_cfg.get('pending_ratio_threshold', 0.5)
                 pending_wait_seconds = pipeline_cfg.get('pending_wait_seconds', 60)
-                while sum(stats.values()) > 0 and stats.get("downloaded", 0) / sum(stats.values()) >= pending_ratio_threshold:
+                while (
+                        enable_v2
+                        and sum(stats.values()) > 0
+                        and stats.get("downloaded", 0) / sum(stats.values()) >= pending_ratio_threshold
+                ):
                     logger.warning(f"downloaded videos so many, wait to be consumed.")
                     time.sleep(pending_wait_seconds)
                     stats = video_store.get_statistics()
@@ -226,8 +270,8 @@ def run_pipeline(config=None):
                                 logger.info(f"Skipping search stage for run {run_id}")
                             else:
                                 max_results = search_cfg.get('per_platform_results', 20)
-                                videos = yt_searcher.search(term.text, max_results=max_results)
-                                videos.extend(bl_searcher.search(term.text, max_results=max_results))
+                                for searcher in searchers.values():
+                                    videos.extend(searcher.search(term.text, max_results=max_results))
                             _advance_pipeline_stage(video_store, run_id, "search")
 
                             downloaded = {}
@@ -249,19 +293,31 @@ def run_pipeline(config=None):
                                 passed, feedback_v1 = v1.filter(videos, term.text)
                                 explorer.receive_feedback(feedback_v1)
 
-                                # 存储每个视频（无论是否下载成功，都保存元数据）
+                                # Only enqueue videos that have a real local file.
+                                # Rows in "downloaded" state are immediately visible to V2.
                                 for video in passed:
-                                    file_path = downloaded.get(video.url)  # 可能为 None 如果下载失败
+                                    file_path = downloaded.get(video.url)
+                                    if not _is_downloaded_file_path(file_path):
+                                        logger.warning(
+                                            "Skipping V2 enqueue for %s:%s because download did not produce a valid file: %r",
+                                            video.platform,
+                                            video.video_id,
+                                            file_path,
+                                        )
+                                        continue
                                     video_store.insert_or_update(video, file_path)
                             _advance_pipeline_stage(video_store, run_id, "v1")
 
-                            if not v2_started and not _skip_stage(resume_stage, "v2"):
+                            if enable_v2 and not v2_started and not _skip_stage(resume_stage, "v2"):
                                 v2_filter.start()
                                 v2_started = True
 
                             # 可选：打印当前存储统计
                             stats = video_store.get_statistics()
                             logger.info(f"Storage stats: {stats}")
+                            target_status = "v2_passed" if enable_v2 else "downloaded"
+                            if stats.get(target_status, 0) >= pipeline_cfg.get("target_qualified", 200):
+                                completed = True
                             break
                         except Exception as e:
                             is_transient = _is_transient_error(e)
@@ -278,11 +334,16 @@ def run_pipeline(config=None):
                                 exc_info=True
                             )
                             break
-                if not v2_started and not _skip_stage(resume_stage, "v2"):
+                    if completed:
+                        break
+                if completed:
+                    break
+                if enable_v2 and not v2_started and not _skip_stage(resume_stage, "v2"):
                     v2_filter.start()
                     v2_started = True
 
-                if stats.get("v2_passed", 0) >= config.get("pipeline", {}).get("target_qualified", 200):
+                target_status = "v2_passed" if enable_v2 else "downloaded"
+                if stats.get(target_status, 0) >= pipeline_cfg.get("target_qualified", 200):
                     completed = True
                     break
 
@@ -300,6 +361,13 @@ def run_pipeline(config=None):
                     _remove_videos(stale_video_paths)
 
                 loop_retry_attempt = 0
+                if resume_stage != "search":
+                    logger.info(
+                        f"Resume stage {resume_stage} completed for run {run_id}; "
+                        "resetting to normal pipeline flow"
+                    )
+                    ensure_stage_components()
+                    resume_stage = "search"
             except Exception as e:
                 is_transient = _is_transient_error(e)
                 if is_transient:

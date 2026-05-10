@@ -24,6 +24,25 @@ class SearchNetworkError(Exception):
     pass
 
 
+def _retry_policy(config: dict, default_attempts: int = 1) -> dict:
+    backoff_cfg = config.get('backoff', {}) if isinstance(config.get('backoff'), dict) else {}
+    return {
+        'max_attempts': max(1, int(config.get('max_attempts', config.get('retries', default_attempts)))),
+        'initial_seconds': float(config.get('backoff_initial_seconds', backoff_cfg.get('initial_seconds', 1))),
+        'max_seconds': float(config.get('backoff_max_seconds', backoff_cfg.get('max_seconds', 30))),
+        'multiplier': max(1.0, float(config.get('backoff_multiplier', backoff_cfg.get('multiplier', 2)))),
+        'jitter_seconds': max(0.0, float(config.get('backoff_jitter_seconds', backoff_cfg.get('jitter_seconds', 0)))),
+    }
+
+
+def _backoff_delay(policy: dict, attempt_index: int) -> float:
+    delay = policy['initial_seconds'] * (policy['multiplier'] ** attempt_index)
+    delay = min(policy['max_seconds'], delay)
+    if policy['jitter_seconds']:
+        delay += random.uniform(0, policy['jitter_seconds'])
+    return delay
+
+
 class YtDlpSearchApi(SearchApi):
     """基于 yt-dlp 的搜索实现 (支持 YouTube 和 BiliBili)，采用混合策略获取分辨率"""
 
@@ -38,11 +57,14 @@ class YtDlpSearchApi(SearchApi):
         self.video_store = video_store
         self.search_config = search_config or {}
         self._cookies = cookies or resolve_platform_cookies(self.search_config, self.platform)
+        self.cookie_fallback_on_anti_bot = bool(self.search_config.get('cookie_fallback_on_anti_bot', False))
         if self.platform not in ['youtube', 'bilibili']:
             raise ValueError("platform must be 'youtube' or 'bilibili'")
 
         fast_cfg = self.search_config.get('fast_search', {})
         detail_cfg = self.search_config.get('detail_fetch', {})
+        self.fast_retry_policy = _retry_policy(fast_cfg, default_attempts=1)
+        self.detail_retry_policy = _retry_policy(detail_cfg, default_attempts=1)
         # 基础配置（用于快速搜索，extract_flat=True）
         self.ydl_opts_fast = {
             'quiet': True,
@@ -73,14 +95,12 @@ class YtDlpSearchApi(SearchApi):
             self.ydl_opts_fast['proxy'] = proxy
         if user_agent:
             self.ydl_opts_fast['user_agent'] = user_agent
-        if self._cookies:
-            self.ydl_opts_fast['cookiefile'] = self._cookies
+        # Keep the resolved cookie path on the instance for callers that need it,
+        # but do not pass cookies to yt-dlp during search/detail metadata fetches.
 
         # 详细配置（用于获取单个视频详情，extract_flat=False）
         self.ydl_opts_detail = copy.deepcopy(self.ydl_opts_fast)
         self.ydl_opts_detail['extract_flat'] = False
-        if self._cookies:
-            self.ydl_opts_detail['cookiefile'] = self._cookies
         self.ydl_opts_detail['remote_components'] = ['ejs:github']
         # 详细模式可能需要更长的超时
         self.ydl_opts_detail['socket_timeout'] = detail_cfg.get('socket_timeout', 60)
@@ -102,36 +122,7 @@ class YtDlpSearchApi(SearchApi):
             search_query = f"bilisearch{max_results}:{query}"
 
         # 阶段1：快速搜索，获取扁平条目列表
-        with yt_dlp.YoutubeDL(self.ydl_opts_fast) as ydl:
-            try:
-                info = ydl.extract_info(search_query, download=False)
-                entries = info.get('entries', [])
-                if not entries:
-                    logger.warning(f"No entries found for query '{query}'")
-                    return []
-            except (DownloadError, ExtractorError) as e:
-                kind = self._classify_ytdlp_error(e)
-                if kind == "rate_limit":
-                    backoff = 5
-                    logger.error(f"Rate limited for query '{query}', backoff {backoff}s: {e}")
-                    time.sleep(backoff)
-                    raise SearchRateLimitError(str(e)) from e
-                if kind == "network":
-                    logger.error(f"Network failure for query '{query}': {e}")
-                    raise SearchNetworkError(str(e)) from e
-                logger.warning(f"No results or unsupported query '{query}': {e}")
-                return []
-            except Exception as e:
-                logger.error(f"Unexpected fast search failure for query '{query}': {e}", exc_info=True)
-                raise
-            except BaseException as e:
-                if isinstance(e, SystemExit):
-                    logger.warning(
-                        f"yt-dlp exited during fast search for query '{query}' "
-                        f"(SystemExit code: {e.code!r})"
-                    )
-                    return []
-                raise
+        entries = self._extract_fast_search(search_query, query)
         logger.info(f"Search for {query} on {self.platform} receive {len(entries)} video infos")
 
         # 快速扁平搜索结束后先去重：
@@ -174,7 +165,8 @@ class YtDlpSearchApi(SearchApi):
 
         details_by_url = {}
         if entry_with_urls:
-            with ThreadPoolExecutor(max_workers=self.search_config.get('detail_workers', 5)) as executor:
+            detail_workers = max(1, int(self.search_config.get('detail_workers', 5)))
+            with ThreadPoolExecutor(max_workers=detail_workers) as executor:
                 future_to_url = {
                     executor.submit(self._get_video_details, video_url): video_url
                     for _, video_url in entry_with_urls
@@ -225,39 +217,155 @@ class YtDlpSearchApi(SearchApi):
         logger.info(f"Search for '{query}' returned {len(results)} videos with resolution info")
         return results
 
+    def _options_for_search_attempt(self, base_options: dict, use_cookies: bool) -> dict:
+        options = base_options.copy()
+        if use_cookies and self._cookies:
+            options['cookiefile'] = self._cookies
+        return options
+
+    def _can_fallback_to_cookies(self, use_cookies: bool) -> bool:
+        return self.cookie_fallback_on_anti_bot and self._cookies and not use_cookies
+
+    def _extract_fast_search(self, search_query: str, query: str) -> List[dict]:
+        policy = self.fast_retry_policy
+        max_attempts = policy['max_attempts']
+        use_cookies = False
+        while True:
+            restart_with_cookies = False
+            for attempt in range(max_attempts):
+                ydl_options = self._options_for_search_attempt(self.ydl_opts_fast, use_cookies)
+                with yt_dlp.YoutubeDL(ydl_options) as ydl:
+                    try:
+                        info = ydl.extract_info(search_query, download=False)
+                        entries = info.get('entries', []) if info else []
+                        if not entries:
+                            logger.warning(f"No entries found for query '{query}'")
+                            return []
+                        return entries
+                    except (DownloadError, ExtractorError) as e:
+                        kind = self._classify_ytdlp_error(e)
+                        if kind == "anti_bot" and self._can_fallback_to_cookies(use_cookies):
+                            logger.warning(
+                                "Anti-bot fast search failure for query '%s' on %s; "
+                                "retrying with cookie fallback",
+                                query,
+                                self.platform,
+                            )
+                            use_cookies = True
+                            restart_with_cookies = True
+                            break
+                        if kind in {"rate_limit", "network", "anti_bot"} and attempt < max_attempts - 1:
+                            delay = _backoff_delay(policy, attempt)
+                            logger.warning(
+                                "Retryable fast search failure for query '%s' on %s "
+                                "(kind=%s, attempt %s/%s, cookies=%s), backing off %.1fs: %s",
+                                query,
+                                self.platform,
+                                kind,
+                                attempt + 1,
+                                max_attempts,
+                                use_cookies,
+                                delay,
+                                e,
+                            )
+                            time.sleep(delay)
+                            continue
+                        if kind in {"rate_limit", "anti_bot"}:
+                            logger.error(f"Rate limited or anti-bot blocked for query '{query}': {e}")
+                            raise SearchRateLimitError(str(e)) from e
+                        if kind == "network":
+                            logger.error(f"Network failure for query '{query}': {e}")
+                            raise SearchNetworkError(str(e)) from e
+                        logger.warning(f"No results or unsupported query '{query}': {e}")
+                        return []
+                    except Exception as e:
+                        logger.error(f"Unexpected fast search failure for query '{query}': {e}", exc_info=True)
+                        raise
+                    except BaseException as e:
+                        if isinstance(e, SystemExit):
+                            logger.warning(
+                                f"yt-dlp exited during fast search for query '{query}' "
+                                f"(SystemExit code: {e.code!r})"
+                            )
+                            return []
+                        raise
+            if restart_with_cookies:
+                continue
+            return []
+
     def _get_video_details(self, url: str) -> Optional[dict]:
         """
         使用 extract_flat=False 获取单个视频的详细信息。
         返回信息字典，失败返回 None。
         """
-        with yt_dlp.YoutubeDL(self.ydl_opts_detail) as ydl:
-            try:
-                info = ydl.extract_info(url, download=False)
-                return info
-            except (DownloadError, ExtractorError) as e:
-                kind = self._classify_ytdlp_error(e)
-                if kind == "network":
-                    logger.error(f"Network error while fetching details for {url}: {e}")
-                elif kind == "rate_limit":
-                    logger.error(f"Rate limit while fetching details for {url}: {e}")
-                else:
-                    logger.warning(f"No detail result for {url}: {e}")
-                return None
-            except Exception as e:
-                logger.error(f"Unexpected error getting details for {url}: {e}", exc_info=True)
-                return None
-            except BaseException as e:
-                if isinstance(e, SystemExit):
-                    logger.warning(
-                        f"yt-dlp exited while fetching details for {url} "
-                        f"(SystemExit code: {e.code!r})"
-                    )
-                    return None
-                raise
+        policy = self.detail_retry_policy
+        max_attempts = policy['max_attempts']
+        use_cookies = False
+        while True:
+            restart_with_cookies = False
+            for attempt in range(max_attempts):
+                ydl_options = self._options_for_search_attempt(self.ydl_opts_detail, use_cookies)
+                with yt_dlp.YoutubeDL(ydl_options) as ydl:
+                    try:
+                        info = ydl.extract_info(url, download=False)
+                        return info
+                    except (DownloadError, ExtractorError) as e:
+                        kind = self._classify_ytdlp_error(e)
+                        if kind == "anti_bot" and self._can_fallback_to_cookies(use_cookies):
+                            logger.warning(
+                                "Anti-bot detail fetch failure for %s on %s; "
+                                "retrying with cookie fallback",
+                                url,
+                                self.platform,
+                            )
+                            use_cookies = True
+                            restart_with_cookies = True
+                            break
+                        if kind in {"rate_limit", "network", "anti_bot"} and attempt < max_attempts - 1:
+                            delay = _backoff_delay(policy, attempt)
+                            logger.warning(
+                                "Retryable detail fetch failure for %s "
+                                "(kind=%s, attempt %s/%s, cookies=%s), backing off %.1fs: %s",
+                                url,
+                                kind,
+                                attempt + 1,
+                                max_attempts,
+                                use_cookies,
+                                delay,
+                                e,
+                            )
+                            time.sleep(delay)
+                            continue
+                        if kind == "network":
+                            logger.error(f"Network error while fetching details for {url}: {e}")
+                        elif kind in {"rate_limit", "anti_bot"}:
+                            logger.error(f"Rate limit or anti-bot while fetching details for {url}: {e}")
+                        else:
+                            logger.warning(f"No detail result for {url}: {e}")
+                        return None
+                    except Exception as e:
+                        logger.error(f"Unexpected error getting details for {url}: {e}", exc_info=True)
+                        return None
+                    except BaseException as e:
+                        if isinstance(e, SystemExit):
+                            logger.warning(
+                                f"yt-dlp exited while fetching details for {url} "
+                                f"(SystemExit code: {e.code!r})"
+                            )
+                            return None
+                        raise
+            if restart_with_cookies:
+                continue
+            return None
 
     @staticmethod
     def _classify_ytdlp_error(exc: Exception) -> str:
         msg = str(exc).lower()
+        if any(k in msg for k in (
+                "sign in to confirm", "not a bot", "precondition failed", "http error 412",
+                "captcha", "verify you are human"
+        )):
+            return "anti_bot"
         if any(k in msg for k in ("429", "too many requests", "rate limit", "ratelimit")):
             return "rate_limit"
         if any(k in msg for k in (

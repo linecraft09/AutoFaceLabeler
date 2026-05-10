@@ -154,14 +154,21 @@ class SearchTermPool:
             categories = set(t.category for t in self.terms)
             if not categories:
                 return []
-            target = self.target_dist.copy()
+            target = {
+                cat: weight
+                for cat, weight in self.target_dist.items()
+                if cat in categories and weight > 0
+            }
             for cat in categories:
                 if cat not in target:
-                    target[cat] = 1.0 / len(categories)
+                    target[cat] = 1.0
             # 归一化
             total_target = sum(target.values())
-            for cat in target:
-                target[cat] /= total_target
+            if total_target <= 0:
+                target = {cat: 1.0 / len(categories) for cat in categories}
+            else:
+                for cat in target:
+                    target[cat] /= total_target
 
             # 计算每个类别应该采样的数量
             counts = {cat: int(round(batch_size * target[cat])) for cat in categories}
@@ -173,8 +180,12 @@ class SearchTermPool:
                 counts[max_cat] += diff
             elif diff < 0:
                 # 减少最小目标比例的类别
-                min_cat = min(target.items(), key=lambda x: x[1])[0]
-                counts[min_cat] += diff  # diff 负数
+                for cat, _ in sorted(target.items(), key=lambda x: x[1]):
+                    if diff == 0:
+                        break
+                    reducible = min(counts[cat], -diff)
+                    counts[cat] -= reducible
+                    diff += reducible
 
             for cat, count in counts.items():
                 if count <= 0:

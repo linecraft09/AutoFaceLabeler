@@ -167,6 +167,20 @@ def test_no_crash_clean_start(video_store, monkeypatch):
     assert "v2:start" in events
 
 
+def test_search_enabled_platforms_can_disable_youtube(video_store, monkeypatch):
+    events = []
+    patch_orchestrator(monkeypatch, events)
+    config = pipeline_config(video_store)
+    config["search"]["enabled_platforms"] = ["bilibili"]
+    config["pipeline"]["enable_v2"] = False
+
+    orchestrator.run_pipeline(config)
+
+    assert "search:youtube" not in events
+    assert "search:bilibili" in events
+    assert "v2:start" not in events
+
+
 def test_marks_stages_complete(video_store, monkeypatch):
     events = []
     patch_orchestrator(monkeypatch, events)
@@ -239,3 +253,26 @@ def test_invalid_resume_stage_restarts_from_search(video_store, monkeypatch):
     assert "search:youtube" in events
     assert "download" in events
     assert "v1" in events
+
+
+def test_failed_downloads_are_not_enqueued_for_v2(video_store, monkeypatch):
+    events = []
+    patch_orchestrator(monkeypatch, events)
+
+    class FailedDownloader:
+        def __init__(self, config_dict=None):
+            events.append("downloader:init:failed")
+
+        def download(self, urls):
+            events.append("download:failed")
+            return {url: None for url in urls}
+
+    monkeypatch.setattr(orchestrator, "DefaultDownloader", FailedDownloader)
+
+    orchestrator.run_pipeline(pipeline_config(video_store))
+
+    with video_store._connect() as conn:
+        rows = conn.execute("SELECT video_id, file_path, status FROM videos").fetchall()
+
+    assert rows == []
+    assert "download:failed" in events

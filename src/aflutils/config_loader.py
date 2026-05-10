@@ -61,6 +61,7 @@ class ConfigLoader:
         """轻量级配置校验：检查关键路径类型与未知键。"""
         expected_schema: Dict[str, Any] = {
             "pipeline": {
+                "enable_v2": bool,
                 "target_qualified": int,
             },
             "v2_filter": {

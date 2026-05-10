@@ -51,6 +51,21 @@ class TestSearchTermPool(unittest.TestCase):
             all_sampled.update(t.text for t in batch)
         self.assertGreaterEqual(len(all_sampled), 2)
 
+    def test_sample_ignores_target_categories_without_terms(self):
+        pool = SearchTermPool(
+            initial_terms=[
+                {"text": "vlog", "platform": "bilibili", "category": "vlog", "weight": 1.0},
+            ],
+            target_distribution={"educational": 0.7, "interview": 0.2, "vlog": 0.1},
+            min_weight=0.1,
+            weight_decay_factor=0.9,
+        )
+
+        sampled = pool.sample(3)
+
+        self.assertEqual(len(sampled), 3)
+        self.assertTrue(all(term.category == "vlog" for term in sampled))
+
     def test_update_stats(self):
         self.pool.update_stats("人物专访", v1_pass_rate=0.5, total_tried=10, total_downloaded=5)
         term = self.pool._find_term("人物专访")

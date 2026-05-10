@@ -14,6 +14,8 @@ Subclasses must implement:
 
 import logging
 import os
+import random
+import time
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any
 
@@ -24,6 +26,40 @@ from aflutils.logger import get_logger
 from aflutils.platform_cookies import detect_platform_from_url, resolve_platform_cookies
 
 logger = get_logger(__name__)
+
+
+def _retry_policy(config: Dict[str, Any]) -> Dict[str, float]:
+    backoff_cfg = config.get("backoff", {}) if isinstance(config.get("backoff"), dict) else {}
+    return {
+        "max_attempts": max(1, int(config.get("max_attempts", config.get("download_attempts", 1)))),
+        "initial_seconds": float(config.get("backoff_initial_seconds", backoff_cfg.get("initial_seconds", 1))),
+        "max_seconds": float(config.get("backoff_max_seconds", backoff_cfg.get("max_seconds", 30))),
+        "multiplier": max(1.0, float(config.get("backoff_multiplier", backoff_cfg.get("multiplier", 2)))),
+        "jitter_seconds": max(0.0, float(config.get("backoff_jitter_seconds", backoff_cfg.get("jitter_seconds", 0)))),
+    }
+
+
+def _backoff_delay(policy: Dict[str, float], attempt_index: int) -> float:
+    delay = policy["initial_seconds"] * (policy["multiplier"] ** attempt_index)
+    delay = min(policy["max_seconds"], delay)
+    if policy["jitter_seconds"]:
+        delay += random.uniform(0, policy["jitter_seconds"])
+    return delay
+
+
+def _strip_internal_retry_options(options: Dict[str, Any]) -> Dict[str, Any]:
+    ydl_options = options.copy()
+    for key in (
+            "max_attempts",
+            "download_attempts",
+            "backoff",
+            "backoff_initial_seconds",
+            "backoff_max_seconds",
+            "backoff_multiplier",
+            "backoff_jitter_seconds",
+    ):
+        ydl_options.pop(key, None)
+    return ydl_options
 
 
 class BaseDownloader(ABC):
@@ -142,36 +178,83 @@ class BaseDownloader(ABC):
         options = self.config.copy()
         options.update(self.get_options_for_url(url) or {})
 
-        try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                self.logger.info(f"Starting download: {url}")
-                info = ydl.extract_info(url, download=True)
+        policy = _retry_policy(options)
+        max_attempts = int(policy["max_attempts"])
+        ydl_options = _strip_internal_retry_options(options)
 
-                # Determine the downloaded file path(s)
-                file_path = None
-                if "entries" in info:
-                    # Playlist case – return the path of the first successfully downloaded video
-                    for entry in info["entries"]:
-                        if entry:
-                            # Get file path for the first entry
-                            file_path = self._get_downloaded_file_path(ydl, entry)
-                            if file_path:
-                                break
-                else:
-                    file_path = self._get_downloaded_file_path(ydl, info)
+        for attempt in range(max_attempts):
+            try:
+                with yt_dlp.YoutubeDL(ydl_options) as ydl:
+                    self.logger.info(f"Starting download: {url}")
+                    info = ydl.extract_info(url, download=True)
+                    if not info:
+                        self.logger.warning(
+                            "Download produced no metadata for %s; yt-dlp likely ignored an error "
+                            "(ignoreerrors=%r)",
+                            url,
+                            ydl_options.get("ignoreerrors"),
+                        )
+                        return None
 
-                self.on_download_complete(url, info)
+                    # Determine the downloaded file path(s)
+                    file_path = None
+                    if "entries" in info:
+                        # Playlist case – return the path of the first successfully downloaded video
+                        for entry in info["entries"]:
+                            if entry:
+                                # Get file path for the first entry
+                                file_path = self._get_downloaded_file_path(ydl, entry)
+                                if file_path:
+                                    break
+                    else:
+                        file_path = self._get_downloaded_file_path(ydl, info)
 
-                if file_path and os.path.exists(file_path):
-                    self.logger.info(f"Download completed: {file_path}")
-                    return file_path
-                else:
-                    self.logger.warning(f"Download succeeded but file not found: {url}")
-                    return None
+                    self.on_download_complete(url, info)
 
-        except Exception as e:
-            self.on_download_error(url, e)
-            return None
+                    if file_path and os.path.exists(file_path):
+                        self.logger.info(f"Download completed: {file_path}")
+                        return file_path
+                    else:
+                        self.logger.warning(f"Download succeeded but file not found: {url}")
+                        return None
+
+            except Exception as e:
+                kind = self._classify_download_error(e)
+                if kind in {"rate_limit", "network", "anti_bot"} and attempt < max_attempts - 1:
+                    delay = _backoff_delay(policy, attempt)
+                    self.logger.warning(
+                        "Retryable download failure for %s (kind=%s, attempt %s/%s), "
+                        "backing off %.1fs: %s",
+                        url,
+                        kind,
+                        attempt + 1,
+                        max_attempts,
+                        delay,
+                        e,
+                    )
+                    time.sleep(delay)
+                    continue
+                self.logger.debug("Download traceback for %s", url, exc_info=True)
+                self.on_download_error(url, e)
+                return None
+        return None
+
+    @staticmethod
+    def _classify_download_error(exc: Exception) -> str:
+        msg = str(exc).lower()
+        if any(k in msg for k in (
+                "sign in to confirm", "not a bot", "precondition failed", "http error 412",
+                "captcha", "verify you are human"
+        )):
+            return "anti_bot"
+        if any(k in msg for k in ("429", "too many requests", "rate limit", "ratelimit")):
+            return "rate_limit"
+        if any(k in msg for k in (
+                "timed out", "timeout", "connection", "network", "name resolution", "temporary failure",
+                "connection reset", "proxy error", "unreachable", "ssl", "eof"
+        )):
+            return "network"
+        return "other"
 
     def _get_downloaded_file_path(self, ydl: yt_dlp.YoutubeDL, info: dict) -> Optional[str]:
         """

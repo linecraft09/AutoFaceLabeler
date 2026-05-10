@@ -17,18 +17,22 @@ class YOLODetector:
 
     def __init__(self, model_path: str = 'yolov8n.pt', device: str = 'cpu', batch_size: int = 16):
         requested_device = (device or 'cpu').lower()
-        self.device = 'cuda' if requested_device == 'cuda' else 'cpu'
         self.batch_size = max(1, int(batch_size))
         self.model = YOLO(model_path)
-        if self.device == 'cuda':
+
+        # Resolve device: 'cuda' → try GPU; 'auto' → use GPU if available; else CPU
+        if requested_device in ('cuda', 'auto'):
             if torch.cuda.is_available():
+                self.device = 'cuda'
                 self.model.to('cuda')
                 logger.info("YOLO model loaded on GPU")
             else:
                 self.device = 'cpu'
-                logger.warning("CUDA requested for YOLO but unavailable; falling back to CPU")
+                if requested_device == 'cuda':
+                    logger.warning("CUDA requested for YOLO but unavailable; falling back to CPU")
                 logger.info("YOLO model loaded on CPU")
         else:
+            self.device = 'cpu'
             logger.info("YOLO model loaded on CPU")
 
     def detect_single_person_segments(self, video_path: str, stream=True) -> Tuple[List[Tuple[int, int]], float]:

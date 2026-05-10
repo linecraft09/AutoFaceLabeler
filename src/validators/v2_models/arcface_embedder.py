@@ -27,9 +27,16 @@ class ArcFaceEmbedder:
         batch_size: int = 16,
     ):
         requested_device = (device or 'cpu').lower()
-        self.device = 'cuda' if requested_device == 'cuda' and torch.cuda.is_available() else 'cpu'
-        if requested_device == 'cuda' and self.device != 'cuda':
-            logger.warning("CUDA requested for ArcFace but unavailable; falling back to CPU")
+        # 'cuda' → try GPU (warn on fallback); 'auto' → use GPU if available, else CPU silently
+        if requested_device in ('cuda', 'auto'):
+            if torch.cuda.is_available():
+                self.device = 'cuda'
+            else:
+                self.device = 'cpu'
+                if requested_device == 'cuda':
+                    logger.warning("CUDA requested for ArcFace but unavailable; falling back to CPU")
+        else:
+            self.device = 'cpu'
         self.db_path = db_path
         self.batch_model_path = resolve_model_path(batch_model_path)
         self.batch_size = int(batch_size)

@@ -13,7 +13,9 @@ search:
     bilibili:
       cookies: 'config/bilibili_cookies.txt'
   per_platform_results: 20
-  detail_workers: 5
+  detail_workers: 2
+  enabled_platforms: [youtube, bilibili]
+  cookie_fallback_on_anti_bot: true
   fast_search:
     socket_timeout: 30
     extractor_retries: 3
@@ -21,8 +23,20 @@ search:
     sleep_interval_min: 3
     sleep_interval_max: 6
     max_sleep_interval: 10
+    max_attempts: 2
+    backoff:
+      initial_seconds: 5
+      max_seconds: 60
+      multiplier: 2
+      jitter_seconds: 2
   detail_fetch:
     socket_timeout: 60
+    max_attempts: 2
+    backoff:
+      initial_seconds: 3
+      max_seconds: 30
+      multiplier: 2
+      jitter_seconds: 1
 
 # === Download ===
 download:
@@ -33,9 +47,15 @@ download:
     bilibili:
       cookies: 'config/bilibili_cookies.txt'
   merge_output_format: 'mkv'
-  concurrent_fragments: 5
+  concurrent_fragments: 2
   retries: 10
   fragment_retries: 10
+  max_attempts: 3
+  backoff:
+    initial_seconds: 10
+    max_seconds: 120
+    multiplier: 2
+    jitter_seconds: 3
   continue_dl: true
   sleep_interval: 5
   max_sleep_interval: 15
@@ -47,6 +67,7 @@ download:
 
 # === Pipeline Orchestrator ===
 pipeline:
+  enable_v2: true
   target_qualified: 200
   batch_size: 10
   max_retries: 3
