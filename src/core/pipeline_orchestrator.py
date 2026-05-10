@@ -354,7 +354,7 @@ def run_pipeline(config=None):
                 # 每轮结束后清理已无保留必要状态的视频文件（仅删文件，不删数据库记录）
                 with claim_lock:
                     stale_video_paths = video_store.claim_file_paths_by_excluded_statuses(
-                        excluded_statuses=("downloaded", "v2_passed")
+                        excluded_statuses=("downloaded", "v2_passed", "v2_in_progress")
                     )
                 if stale_video_paths:
                     logger.info(f"Cleaning stale videos: {len(stale_video_paths)} files")
