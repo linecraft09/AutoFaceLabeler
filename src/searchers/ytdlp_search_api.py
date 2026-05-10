@@ -43,6 +43,32 @@ def _backoff_delay(policy: dict, attempt_index: int) -> float:
     return delay
 
 
+def _log_anti_bot_wait(
+        stage: str,
+        target: str,
+        platform: str,
+        attempt: int,
+        max_attempts: int,
+        use_cookies: bool,
+        wait_seconds: float,
+        action: str,
+        error: Exception,
+) -> None:
+    logger.warning(
+        "Anti-bot detected during %s for %s on %s "
+        "(attempt %s/%s, cookies=%s); anti_bot_wait_seconds=%.1f; %s: %s",
+        stage,
+        target,
+        platform,
+        attempt,
+        max_attempts,
+        use_cookies,
+        wait_seconds,
+        action,
+        error,
+    )
+
+
 class YtDlpSearchApi(SearchApi):
     """基于 yt-dlp 的搜索实现 (支持 YouTube 和 BiliBili)，采用混合策略获取分辨率"""
 
@@ -245,33 +271,60 @@ class YtDlpSearchApi(SearchApi):
                     except (DownloadError, ExtractorError) as e:
                         kind = self._classify_ytdlp_error(e)
                         if kind == "anti_bot" and self._can_fallback_to_cookies(use_cookies):
-                            logger.warning(
-                                "Anti-bot fast search failure for query '%s' on %s; "
-                                "retrying with cookie fallback",
-                                query,
-                                self.platform,
+                            _log_anti_bot_wait(
+                                stage="fast search",
+                                target=f"query '{query}'",
+                                platform=self.platform,
+                                attempt=attempt + 1,
+                                max_attempts=max_attempts,
+                                use_cookies=use_cookies,
+                                wait_seconds=0.0,
+                                action="retrying with cookie fallback",
+                                error=e,
                             )
                             use_cookies = True
                             restart_with_cookies = True
                             break
                         if kind in {"rate_limit", "network", "anti_bot"} and attempt < max_attempts - 1:
                             delay = _backoff_delay(policy, attempt)
-                            logger.warning(
-                                "Retryable fast search failure for query '%s' on %s "
-                                "(kind=%s, attempt %s/%s, cookies=%s), backing off %.1fs: %s",
-                                query,
-                                self.platform,
-                                kind,
-                                attempt + 1,
-                                max_attempts,
-                                use_cookies,
-                                delay,
-                                e,
-                            )
+                            if kind == "anti_bot":
+                                _log_anti_bot_wait(
+                                    stage="fast search",
+                                    target=f"query '{query}'",
+                                    platform=self.platform,
+                                    attempt=attempt + 1,
+                                    max_attempts=max_attempts,
+                                    use_cookies=use_cookies,
+                                    wait_seconds=delay,
+                                    action="backing off before retry",
+                                    error=e,
+                                )
+                            else:
+                                logger.warning(
+                                    "Retryable fast search failure for query '%s' on %s "
+                                    "(kind=%s, attempt %s/%s, cookies=%s), backing off %.1fs: %s",
+                                    query,
+                                    self.platform,
+                                    kind,
+                                    attempt + 1,
+                                    max_attempts,
+                                    use_cookies,
+                                    delay,
+                                    e,
+                                )
                             time.sleep(delay)
                             continue
                         if kind in {"rate_limit", "anti_bot"}:
-                            logger.error(f"Rate limited or anti-bot blocked for query '{query}': {e}")
+                            if kind == "anti_bot":
+                                logger.error(
+                                    "Anti-bot blocked fast search for query '%s' on %s; "
+                                    "anti_bot_wait_seconds=0.0; no retry attempt remains: %s",
+                                    query,
+                                    self.platform,
+                                    e,
+                                )
+                            else:
+                                logger.error(f"Rate limited or anti-bot blocked for query '{query}': {e}")
                             raise SearchRateLimitError(str(e)) from e
                         if kind == "network":
                             logger.error(f"Network failure for query '{query}': {e}")
@@ -312,33 +365,59 @@ class YtDlpSearchApi(SearchApi):
                     except (DownloadError, ExtractorError) as e:
                         kind = self._classify_ytdlp_error(e)
                         if kind == "anti_bot" and self._can_fallback_to_cookies(use_cookies):
-                            logger.warning(
-                                "Anti-bot detail fetch failure for %s on %s; "
-                                "retrying with cookie fallback",
-                                url,
-                                self.platform,
+                            _log_anti_bot_wait(
+                                stage="detail fetch",
+                                target=url,
+                                platform=self.platform,
+                                attempt=attempt + 1,
+                                max_attempts=max_attempts,
+                                use_cookies=use_cookies,
+                                wait_seconds=0.0,
+                                action="retrying with cookie fallback",
+                                error=e,
                             )
                             use_cookies = True
                             restart_with_cookies = True
                             break
                         if kind in {"rate_limit", "network", "anti_bot"} and attempt < max_attempts - 1:
                             delay = _backoff_delay(policy, attempt)
-                            logger.warning(
-                                "Retryable detail fetch failure for %s "
-                                "(kind=%s, attempt %s/%s, cookies=%s), backing off %.1fs: %s",
-                                url,
-                                kind,
-                                attempt + 1,
-                                max_attempts,
-                                use_cookies,
-                                delay,
-                                e,
-                            )
+                            if kind == "anti_bot":
+                                _log_anti_bot_wait(
+                                    stage="detail fetch",
+                                    target=url,
+                                    platform=self.platform,
+                                    attempt=attempt + 1,
+                                    max_attempts=max_attempts,
+                                    use_cookies=use_cookies,
+                                    wait_seconds=delay,
+                                    action="backing off before retry",
+                                    error=e,
+                                )
+                            else:
+                                logger.warning(
+                                    "Retryable detail fetch failure for %s "
+                                    "(kind=%s, attempt %s/%s, cookies=%s), backing off %.1fs: %s",
+                                    url,
+                                    kind,
+                                    attempt + 1,
+                                    max_attempts,
+                                    use_cookies,
+                                    delay,
+                                    e,
+                                )
                             time.sleep(delay)
                             continue
                         if kind == "network":
                             logger.error(f"Network error while fetching details for {url}: {e}")
-                        elif kind in {"rate_limit", "anti_bot"}:
+                        elif kind == "anti_bot":
+                            logger.error(
+                                "Anti-bot blocked detail fetch for %s on %s; "
+                                "anti_bot_wait_seconds=0.0; no retry attempt remains: %s",
+                                url,
+                                self.platform,
+                                e,
+                            )
+                        elif kind == "rate_limit":
                             logger.error(f"Rate limit or anti-bot while fetching details for {url}: {e}")
                         else:
                             logger.warning(f"No detail result for {url}: {e}")

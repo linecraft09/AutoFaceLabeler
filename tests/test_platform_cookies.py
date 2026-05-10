@@ -1,4 +1,5 @@
 import importlib.util
+import logging
 import sys
 import types
 from pathlib import Path
@@ -110,9 +111,10 @@ def test_downloader_handles_ignored_ytdlp_error_returning_none(monkeypatch):
     }
 
 
-def test_search_fast_search_retries_anti_bot_with_backoff(monkeypatch):
+def test_search_fast_search_retries_anti_bot_with_backoff(monkeypatch, caplog):
     calls = {"count": 0}
     sleeps = []
+    caplog.set_level(logging.WARNING, logger=ytdlp_search_api.logger.name)
 
     class FakeDownloadError(Exception):
         pass
@@ -157,10 +159,13 @@ def test_search_fast_search_retries_anti_bot_with_backoff(monkeypatch):
     assert [entry["id"] for entry in entries] == ["BV123"]
     assert calls["count"] == 2
     assert sleeps == [2]
+    assert "Anti-bot detected during fast search" in caplog.text
+    assert "anti_bot_wait_seconds=2.0" in caplog.text
 
 
-def test_search_fast_search_falls_back_to_cookies_on_anti_bot(monkeypatch):
+def test_search_fast_search_falls_back_to_cookies_on_anti_bot(monkeypatch, caplog):
     seen_cookiefiles = []
+    caplog.set_level(logging.WARNING, logger=ytdlp_search_api.logger.name)
 
     class FakeDownloadError(Exception):
         pass
@@ -196,10 +201,13 @@ def test_search_fast_search_falls_back_to_cookies_on_anti_bot(monkeypatch):
 
     assert [entry["id"] for entry in entries] == ["BV123"]
     assert seen_cookiefiles == [None, "config/bilibili_cookies.txt"]
+    assert "Anti-bot detected during fast search" in caplog.text
+    assert "anti_bot_wait_seconds=0.0" in caplog.text
 
 
-def test_search_detail_fetch_falls_back_to_cookies_on_anti_bot(monkeypatch):
+def test_search_detail_fetch_falls_back_to_cookies_on_anti_bot(monkeypatch, caplog):
     seen_cookiefiles = []
+    caplog.set_level(logging.WARNING, logger=ytdlp_search_api.logger.name)
 
     class FakeDownloadError(Exception):
         pass
@@ -233,6 +241,58 @@ def test_search_detail_fetch_falls_back_to_cookies_on_anti_bot(monkeypatch):
 
     assert searcher._get_video_details("https://www.youtube.com/watch?v=abc") == {"id": "abc", "title": "ok"}
     assert seen_cookiefiles == [None, "config/youtube_cookies.txt"]
+    assert "Anti-bot detected during detail fetch" in caplog.text
+    assert "anti_bot_wait_seconds=0.0" in caplog.text
+
+
+def test_search_detail_fetch_retries_anti_bot_with_backoff(monkeypatch, caplog):
+    calls = {"count": 0}
+    sleeps = []
+    caplog.set_level(logging.WARNING, logger=ytdlp_search_api.logger.name)
+
+    class FakeDownloadError(Exception):
+        pass
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, url, download):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise FakeDownloadError("Sign in to confirm you're not a bot")
+            return {"id": "abc", "title": "ok"}
+
+    monkeypatch.setattr(ytdlp_search_api, "DownloadError", FakeDownloadError)
+    monkeypatch.setattr(ytdlp_search_api.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    monkeypatch.setattr(ytdlp_search_api.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    searcher = YtDlpSearchApi(
+        platform="youtube",
+        search_config={
+            "detail_fetch": {
+                "max_attempts": 2,
+                "backoff": {
+                    "initial_seconds": 3,
+                    "max_seconds": 8,
+                    "multiplier": 2,
+                    "jitter_seconds": 0,
+                },
+            },
+        },
+    )
+
+    assert searcher._get_video_details("https://www.youtube.com/watch?v=abc") == {"id": "abc", "title": "ok"}
+    assert calls["count"] == 2
+    assert sleeps == [3]
+    assert "Anti-bot detected during detail fetch" in caplog.text
+    assert "anti_bot_wait_seconds=3.0" in caplog.text
 
 
 def test_downloader_retries_anti_bot_and_strips_internal_options(monkeypatch, tmp_path):
