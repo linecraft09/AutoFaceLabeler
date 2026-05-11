@@ -25,16 +25,20 @@ class FakeFaceEmbedder:
 
 
 class TestValidatorFineFilter(unittest.TestCase):
-    def _make_filter(self, embedder):
+    def _make_filter(self, embedder, fine_overrides=None):
+        fine_config = {
+            'dedup_threshold': 0.5,
+            'speech_required': False,
+            'min_duration': 0,
+        }
+        if fine_overrides:
+            fine_config.update(fine_overrides)
         with patch('validators.validator.YOLODetector'), \
              patch('validators.validator.ArcFaceEmbedder', return_value=embedder):
             return V2ContentFilter(
                 {
                     'device': 'cpu',
-                    'fine': {
-                        'dedup_threshold': 0.5,
-                        'speech_required': False,
-                    },
+                    'fine': fine_config,
                 },
                 video_store=object(),
             )
@@ -102,6 +106,60 @@ class TestValidatorFineFilter(unittest.TestCase):
             embedder.added_embeddings[1],
             embeddings['clip_3.mp4'],
         )
+
+    def test_rejects_when_selected_total_duration_is_shorter_than_minimum(self):
+        embedder = FakeFaceEmbedder()
+        filt = self._make_filter(embedder, {'min_duration': 30})
+        clips = ['clip_1.mp4', 'clip_2.mp4']
+        embeddings = {
+            'clip_1.mp4': np.ones(512, dtype=np.float32),
+            'clip_2.mp4': np.full(512, 2.0, dtype=np.float32),
+        }
+
+        def process_single(path):
+            return path, True, (0.8, 0.8, embeddings[path]), None
+
+        with patch.object(filt, '_process_single_video', side_effect=process_single), \
+             patch('validators.validator.VU.get_video_secs', return_value=14.0), \
+             patch('validators.validator.VU.concat_videos') as concat:
+            result, fail_reason = filt._fine_filter(clips)
+
+        self.assertIsNone(result)
+        self.assertEqual(fail_reason, 'merged_duration_too_short')
+        concat.assert_not_called()
+        self.assertEqual(embedder.added_embeddings, [])
+
+    def test_rejects_when_merged_video_duration_is_shorter_than_minimum(self):
+        embedder = FakeFaceEmbedder()
+        filt = self._make_filter(embedder, {'min_duration': 30})
+        clips = ['clip_1.mp4', 'clip_2.mp4']
+        embeddings = {
+            'clip_1.mp4': np.ones(512, dtype=np.float32),
+            'clip_2.mp4': np.full(512, 2.0, dtype=np.float32),
+        }
+
+        def process_single(path):
+            return path, True, (0.8, 0.8, embeddings[path]), None
+
+        durations = {
+            'clip_1.mp4': 20.0,
+            'clip_2.mp4': 20.0,
+            'merged.mp4': 29.0,
+        }
+
+        with patch.object(filt, '_process_single_video', side_effect=process_single), \
+             patch(
+                 'validators.validator.VU.get_video_secs',
+                 side_effect=lambda path: durations[path],
+             ), \
+             patch('validators.validator.VU.concat_videos', return_value='merged.mp4'), \
+             patch('validators.validator.os.unlink') as unlink:
+            result, fail_reason = filt._fine_filter(clips)
+
+        self.assertIsNone(result)
+        self.assertEqual(fail_reason, 'merged_duration_too_short')
+        unlink.assert_called_once_with('merged.mp4')
+        self.assertEqual(embedder.added_embeddings, [])
 
 
 if __name__ == '__main__':

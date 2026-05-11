@@ -170,6 +170,7 @@ v2_filter:
     model_name: 'buffalo_m'
     face_db_path: './data/face_index.faiss'
     rebuild_faiss_on_startup: false
+    min_duration: 30
     dedup_threshold: 0.75
     speech_required: true
     head_pose:

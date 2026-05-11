@@ -59,6 +59,7 @@ class V2ContentFilter:
         self.laplacian_required_ratio = laplacian_cfg.get('required_ratio', 0.8)
         self.face_required_ratio = face_cfg.get('required_ratio', 0.8)
         self.dedup_threshold = fine_cfg.get('dedup_threshold', 0.7)
+        self.min_qualified_duration = float(fine_cfg.get('min_duration', 30))
         self.batch_size = int(fine_cfg.get('batch_size', 16))
         self._batch_detector = None
         self._landmark_pose = None
@@ -94,6 +95,7 @@ class V2ContentFilter:
                 'head_pose_out_of_range': 0,
                 'blurry_face': 0,
                 'duplicate': 0,
+                'merged_duration_too_short': 0,
             }
         }
 
@@ -483,6 +485,13 @@ class V2ContentFilter:
             f"Fine filter selected {len(passed_videos)} clips, total duration {total_duration:.2f}s"
         )
 
+        if self.min_qualified_duration > 0 and total_duration < self.min_qualified_duration:
+            logger.info(
+                f"Fine filter rejected selected clips because total duration "
+                f"{total_duration:.2f}s is shorter than {self.min_qualified_duration:.2f}s"
+            )
+            return None, "merged_duration_too_short"
+
         if len(to_merge) == 1:
             self._save_face_embeddings(video_id, platform, selected_embeddings)
             for embedding in selected_embeddings:
@@ -492,6 +501,19 @@ class V2ContentFilter:
         merged_path = VU.concat_videos(to_merge)
         if merged_path is None:
             return None, "concat_failed"
+
+        if self.min_qualified_duration > 0:
+            merged_duration = VU.get_video_secs(merged_path)
+            if merged_duration < self.min_qualified_duration:
+                logger.info(
+                    f"Fine filter rejected merged video {merged_path} because duration "
+                    f"{merged_duration:.2f}s is shorter than {self.min_qualified_duration:.2f}s"
+                )
+                try:
+                    os.unlink(merged_path)
+                except OSError as e:
+                    logger.warning(f"Failed to remove short merged video {merged_path}: {e}")
+                return None, "merged_duration_too_short"
 
         self._save_face_embeddings(video_id, platform, selected_embeddings)
         for embedding in selected_embeddings:
