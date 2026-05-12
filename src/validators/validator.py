@@ -426,6 +426,7 @@ class V2ContentFilter:
         """
         Process multiple clips in fine filtering and keep qualified clips in temporal order.
         """
+        other_video_embeddings = self._load_other_video_embeddings(video_id, platform)
 
         # Collect per-clip processing output.
         results = []  # (video_path, success, data, fail_reason)
@@ -457,23 +458,15 @@ class V2ContentFilter:
             else:
                 fail_reasons[video_path] = fail_reason
 
-        # Dedup in temporal order. The first occurrence is kept, and later
-        # duplicate clips are skipped before embeddings are persisted.
+        # Dedup only against embeddings from other source videos. Multiple
+        # clips from the same source video may legitimately contain the same
+        # person, so candidates in this batch are not compared with each other.
         passed_videos = []
-        already_selected_embeddings = []
         for video_path, pose_ratio, clarity_ratio, embedding, duration_secs in passed_candidates:
-            if self.face_embedder.is_duplicate(embedding, self.dedup_threshold):
-                fail_reasons[video_path] = 'duplicate'
-                continue
-            is_local_duplicate = any(
-                np.linalg.norm(embedding - selected) < self.dedup_threshold
-                for selected in already_selected_embeddings
-            )
-            if is_local_duplicate:
+            if self._is_duplicate_from_other_video(embedding, other_video_embeddings):
                 fail_reasons[video_path] = 'duplicate'
                 continue
             passed_videos.append((video_path, pose_ratio, clarity_ratio, embedding, duration_secs))
-            already_selected_embeddings.append(embedding)
 
         if not passed_videos:
             all_fail_reasons = '|'.join(fail_reasons.values())
@@ -520,6 +513,47 @@ class V2ContentFilter:
         for embedding in selected_embeddings:
             self.face_embedder.add_embedding(embedding)
         return merged_path, None
+
+    def _load_other_video_embeddings(
+        self,
+        video_id: str,
+        platform: str
+    ) -> Optional[np.ndarray]:
+        if not video_id or not platform:
+            return None
+
+        loader = getattr(self.store, 'load_embeddings_excluding', None)
+        if not callable(loader):
+            return None
+
+        try:
+            _, embeddings = loader(video_id, platform)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load source-aware embeddings for {platform}:{video_id}: {e}"
+            )
+            return None
+
+        if not embeddings:
+            return np.empty((0, 512), dtype=np.float32)
+        return np.vstack([
+            np.asarray(embedding, dtype=np.float32).reshape(512,)
+            for embedding in embeddings
+        ]).astype(np.float32)
+
+    def _is_duplicate_from_other_video(
+        self,
+        embedding: np.ndarray,
+        other_video_embeddings: Optional[np.ndarray]
+    ) -> bool:
+        if other_video_embeddings is None:
+            return self.face_embedder.is_duplicate(embedding, self.dedup_threshold)
+        if other_video_embeddings.shape[0] == 0:
+            return False
+
+        query = np.asarray(embedding, dtype=np.float32).reshape(1, 512)
+        distances = np.linalg.norm(other_video_embeddings - query, axis=1)
+        return bool(np.any(distances < self.dedup_threshold))
 
     def _maybe_rebuild_faiss_index(self, fine_cfg: Dict[str, Any]):
         face_db_path = fine_cfg.get('face_db_path', 'data/face_index.faiss')

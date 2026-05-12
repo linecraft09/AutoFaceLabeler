@@ -49,6 +49,21 @@ def test_save_and_load_embeddings(tmp_path):
         np.testing.assert_allclose(actual, expected)
 
 
+def test_load_embeddings_excluding_current_source(tmp_path):
+    store = _make_store(tmp_path)
+    current_embedding = _embedding(1)
+    other_embedding = _embedding(2)
+
+    store.save_embeddings("video-1", "youtube", [current_embedding])
+    store.save_embeddings("video-2", "youtube", [other_embedding])
+
+    labels, loaded = store.load_embeddings_excluding("video-1", "youtube")
+
+    assert labels == ["youtube:video-2:face"]
+    assert len(loaded) == 1
+    np.testing.assert_allclose(loaded[0], other_embedding)
+
+
 def test_save_duplicate_embedding(tmp_path):
     store = _make_store(tmp_path)
 

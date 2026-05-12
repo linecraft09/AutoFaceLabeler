@@ -436,6 +436,32 @@ class VideoStore:
             embeddings.append(embedding)
         return labels, embeddings
 
+    def load_embeddings_excluding(
+        self,
+        video_id: str,
+        platform: str
+    ) -> tuple[list[str], list[np.ndarray]]:
+        """Load persisted embeddings that do not belong to the given source video."""
+        import numpy as np
+
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT video_id, platform, label, embedding_blob
+                FROM embeddings
+                WHERE NOT (video_id = ? AND platform = ?)
+                ORDER BY id ASC
+            """, (video_id, platform))
+            rows = cursor.fetchall()
+
+        labels = []
+        embeddings = []
+        for row in rows:
+            labels.append(f"{row['platform']}:{row['video_id']}:{row['label']}")
+            embedding = np.frombuffer(row["embedding_blob"], dtype=np.float32).copy().reshape(512,)
+            embeddings.append(embedding)
+        return labels, embeddings
+
     def get_embedding_count(self) -> int:
         """Return the total number of persisted embeddings."""
         with self._connect() as conn:

@@ -25,8 +25,29 @@ class FakeFaceEmbedder:
         self.added_embeddings.append(embedding)
 
 
+class FakeEmbeddingStore:
+    def __init__(self, embeddings_by_source=None):
+        self.embeddings_by_source = embeddings_by_source or {}
+        self.saved_embeddings = []
+
+    def load_embeddings_excluding(self, video_id, platform):
+        labels = []
+        embeddings = []
+        for (source_video_id, source_platform), source_embeddings in self.embeddings_by_source.items():
+            if source_video_id == video_id and source_platform == platform:
+                continue
+            for index, embedding in enumerate(source_embeddings):
+                labels.append(f"{source_platform}:{source_video_id}:face:{index}")
+                embeddings.append(embedding)
+        return labels, embeddings
+
+    def save_embeddings(self, video_id, platform, embeddings):
+        self.saved_embeddings.append((video_id, platform, list(embeddings)))
+        return len(embeddings)
+
+
 class TestValidatorFineFilter(unittest.TestCase):
-    def _make_filter(self, embedder, fine_overrides=None):
+    def _make_filter(self, embedder, fine_overrides=None, video_store=None):
         fine_config = {
             'dedup_threshold': 0.5,
             'speech_required': False,
@@ -41,7 +62,7 @@ class TestValidatorFineFilter(unittest.TestCase):
                     'device': 'cpu',
                     'fine': fine_config,
                 },
-                video_store=object(),
+                video_store=video_store or object(),
             )
 
     def test_keeps_temporal_order_and_persists_all_selected_embeddings(self):
@@ -76,7 +97,7 @@ class TestValidatorFineFilter(unittest.TestCase):
         for added, expected_path in zip(embedder.added_embeddings, clips):
             np.testing.assert_array_equal(added, embeddings[expected_path])
 
-    def test_local_dedup_keeps_first_temporal_occurrence(self):
+    def test_same_source_duplicate_embeddings_are_kept(self):
         embedder = FakeFaceEmbedder()
         filt = self._make_filter(embedder)
         clips = ['clip_1.mp4', 'clip_2.mp4', 'clip_3.mp4']
@@ -97,16 +118,56 @@ class TestValidatorFineFilter(unittest.TestCase):
 
         self.assertEqual(result, 'merged.mp4')
         self.assertIsNone(fail_reason)
-        concat.assert_called_once_with(['clip_1.mp4', 'clip_3.mp4'])
-        self.assertEqual(len(embedder.added_embeddings), 2)
-        np.testing.assert_array_equal(
-            embedder.added_embeddings[0],
-            embeddings['clip_1.mp4'],
-        )
-        np.testing.assert_array_equal(
-            embedder.added_embeddings[1],
-            embeddings['clip_3.mp4'],
-        )
+        concat.assert_called_once_with(clips)
+        self.assertEqual(len(embedder.added_embeddings), 3)
+        for added, expected_path in zip(embedder.added_embeddings, clips):
+            np.testing.assert_array_equal(added, embeddings[expected_path])
+
+    def test_rejects_duplicate_embedding_from_other_source_video(self):
+        embedder = FakeFaceEmbedder()
+        duplicate_embedding = np.ones(512, dtype=np.float32)
+        store = FakeEmbeddingStore({
+            ('other_video', 'youtube'): [duplicate_embedding.copy()],
+        })
+        filt = self._make_filter(embedder, video_store=store)
+
+        def process_single(path):
+            return path, True, (0.8, 0.8, duplicate_embedding), None
+
+        with patch.object(filt, '_process_single_video', side_effect=process_single), \
+             patch('validators.validator.VU.get_video_secs', return_value=1.0):
+            result, fail_reason = filt._fine_filter(
+                ['clip_1.mp4'],
+                video_id='current_video',
+                platform='youtube',
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(fail_reason, 'duplicate')
+        self.assertEqual(embedder.added_embeddings, [])
+
+    def test_ignores_duplicate_embedding_from_current_source_video(self):
+        embedder = FakeFaceEmbedder()
+        duplicate_embedding = np.ones(512, dtype=np.float32)
+        store = FakeEmbeddingStore({
+            ('current_video', 'youtube'): [duplicate_embedding.copy()],
+        })
+        filt = self._make_filter(embedder, video_store=store)
+
+        def process_single(path):
+            return path, True, (0.8, 0.8, duplicate_embedding), None
+
+        with patch.object(filt, '_process_single_video', side_effect=process_single), \
+             patch('validators.validator.VU.get_video_secs', return_value=1.0):
+            result, fail_reason = filt._fine_filter(
+                ['clip_1.mp4'],
+                video_id='current_video',
+                platform='youtube',
+            )
+
+        self.assertEqual(result, 'clip_1.mp4')
+        self.assertIsNone(fail_reason)
+        self.assertEqual(len(embedder.added_embeddings), 1)
 
     def test_rejects_when_selected_total_duration_is_shorter_than_minimum(self):
         embedder = FakeFaceEmbedder()
