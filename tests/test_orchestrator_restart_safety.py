@@ -182,6 +182,36 @@ def test_search_enabled_platforms_can_disable_youtube(video_store, monkeypatch):
     assert "v2:start" not in events
 
 
+def test_search_platform_cooldown_does_not_block_other_platforms(video_store, monkeypatch):
+    events = []
+    patch_orchestrator(monkeypatch, events)
+
+    class FakeCooldownError(Exception):
+        platform = "bilibili"
+        stage = "detail_fetch"
+        reason = "timeout"
+
+    class CoolingSearcher:
+        def __init__(self, platform, **kwargs):
+            self.platform = platform
+            events.append(f"searcher:init:{platform}")
+
+        def search(self, query, max_results=20):
+            events.append(f"search:{self.platform}")
+            if self.platform == "bilibili":
+                raise FakeCooldownError("bilibili detail timeout")
+            return [make_video(f"{self.platform}-{query}", platform=self.platform)]
+
+    monkeypatch.setattr(orchestrator, "YtDlpSearchApi", CoolingSearcher)
+
+    orchestrator.run_pipeline(pipeline_config(video_store))
+
+    assert "search:youtube" in events
+    assert "search:bilibili" in events
+    assert "v1" in events
+    assert video_store.get_download_queue_count() == 1
+
+
 def test_marks_stages_complete(video_store, monkeypatch):
     events = []
     patch_orchestrator(monkeypatch, events)

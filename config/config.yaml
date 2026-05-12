@@ -10,14 +10,28 @@ search:
   platforms:
     youtube:
       cookies: 'config/youtube_cookies.txt'
+      cooldown_seconds: 900
+      fast_search:
+        timeout_seconds: 45
+      detail_fetch:
+        timeout_seconds: 90
     bilibili:
       cookies: 'config/bilibili_cookies.txt'
+      cooldown_seconds: 1800
+      fast_search:
+        timeout_seconds: 45
+      detail_fetch:
+        socket_timeout: 45
+        timeout_seconds: 75
   per_platform_results: 20
   detail_workers: 2
   enabled_platforms: [youtube, bilibili]
   cookie_fallback_on_anti_bot: true
+  platform_cooldown:
+    default_seconds: 900
   fast_search:
     socket_timeout: 30
+    timeout_seconds: 45
     extractor_retries: 3
     file_access_retries: 3
     sleep_interval_min: 3
@@ -31,6 +45,7 @@ search:
       jitter_seconds: 2
   detail_fetch:
     socket_timeout: 60
+    timeout_seconds: 90
     max_attempts: 2
     backoff:
       initial_seconds: 3

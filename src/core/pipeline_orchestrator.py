@@ -118,6 +118,44 @@ def _enabled_search_platforms(search_cfg: dict) -> list:
     ]
 
 
+def _is_search_cooldown_error(exc: Exception) -> bool:
+    return (
+            getattr(exc, "platform", None)
+            and getattr(exc, "stage", None)
+            and getattr(exc, "reason", None)
+    )
+
+
+def _platform_cooldown_seconds(search_cfg: dict, platform: str, stage: str = None) -> float:
+    platform_cfg = search_cfg.get("platforms", {}).get(platform, {})
+    if not isinstance(platform_cfg, dict):
+        platform_cfg = {}
+    stage_cfg = platform_cfg.get(stage, {}) if stage else {}
+    if not isinstance(stage_cfg, dict):
+        stage_cfg = {}
+    cooldown_cfg = search_cfg.get("platform_cooldown", {})
+    if not isinstance(cooldown_cfg, dict):
+        cooldown_cfg = {}
+
+    value = stage_cfg.get(
+        "cooldown_seconds",
+        platform_cfg.get(
+            "cooldown_seconds",
+            platform_cfg.get(
+                "anti_bot_cooldown_seconds",
+                search_cfg.get(
+                    "platform_cooldown_seconds",
+                    search_cfg.get(
+                        "anti_bot_cooldown_seconds",
+                        cooldown_cfg.get("seconds", cooldown_cfg.get("default_seconds", 900)),
+                    ),
+                ),
+            ),
+        ),
+    )
+    return max(0.0, float(value))
+
+
 def _is_transient_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     transient_markers = (
@@ -223,6 +261,7 @@ def run_pipeline(config=None):
         enabled_platforms = _enabled_search_platforms(search_cfg)
         logger.info(f"Enabled search platforms: {enabled_platforms}")
         searchers = {}
+        platform_cooldowns = {}
         if not _skip_stage(resume_stage, "search"):
             for platform in enabled_platforms:
                 searchers[platform] = YtDlpSearchApi(
@@ -306,6 +345,46 @@ def run_pipeline(config=None):
                     )
             return downloaded_count
 
+        def is_platform_available(platform):
+            cooldown_until = platform_cooldowns.get(platform)
+            if not cooldown_until:
+                return True
+            now = time.monotonic()
+            if cooldown_until > now:
+                remaining = cooldown_until - now
+                logger.warning(
+                    "Skipping search on %s; platform is cooling down for %.1fs",
+                    platform,
+                    remaining,
+                )
+                return False
+            platform_cooldowns.pop(platform, None)
+            logger.info(f"Search cooldown expired for {platform}; resuming platform")
+            return True
+
+        def cool_down_platform(platform, stage, reason, error):
+            cooldown_seconds = _platform_cooldown_seconds(search_cfg, platform, stage)
+            if cooldown_seconds <= 0:
+                logger.warning(
+                    "Search platform %s triggered cooldown condition at %s "
+                    "(reason=%s), but cooldown_seconds is disabled: %s",
+                    platform,
+                    stage,
+                    reason,
+                    error,
+                )
+                return
+            platform_cooldowns[platform] = time.monotonic() + cooldown_seconds
+            logger.warning(
+                "Cooling down search platform %s for %.1fs after %s failure "
+                "(reason=%s): %s",
+                platform,
+                cooldown_seconds,
+                stage,
+                reason,
+                error,
+            )
+
         # V2 can run from process startup and will pick up each successful download.
         if enable_v2:
             v2_config = dict(config.get('v2_filter', {}))
@@ -342,8 +421,21 @@ def run_pipeline(config=None):
                                 logger.info(f"Skipping search stage for run {run_id}")
                             else:
                                 max_results = search_cfg.get('per_platform_results', 20)
-                                for searcher in searchers.values():
-                                    videos.extend(searcher.search(term.text, max_results=max_results))
+                                for platform, searcher in searchers.items():
+                                    if not is_platform_available(platform):
+                                        continue
+                                    try:
+                                        videos.extend(searcher.search(term.text, max_results=max_results))
+                                    except Exception as search_exc:
+                                        if _is_search_cooldown_error(search_exc):
+                                            cool_down_platform(
+                                                getattr(search_exc, "platform", platform),
+                                                getattr(search_exc, "stage", None),
+                                                getattr(search_exc, "reason", "unknown"),
+                                                search_exc,
+                                            )
+                                            continue
+                                        raise
                                 search_completed = True
                             if search_completed:
                                 _advance_pipeline_stage(video_store, run_id, "search")

@@ -1,8 +1,11 @@
 import importlib.util
 import logging
 import sys
+import time
 import types
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -30,7 +33,7 @@ from aflutils.platform_cookies import detect_platform_from_url, resolve_platform
 import downloaders.base_downloader as base_downloader
 from downloaders.base_downloader import DefaultDownloader
 import searchers.ytdlp_search_api as ytdlp_search_api
-from searchers.ytdlp_search_api import YtDlpSearchApi
+from searchers.ytdlp_search_api import SearchTimeoutError, YtDlpSearchApi
 
 
 PLATFORM_COOKIE_CONFIG = {
@@ -86,6 +89,56 @@ def test_search_api_keeps_cookiefile_out_of_search_options():
     assert "cookiefile" not in youtube_search.ydl_opts_detail
     assert "cookiefile" not in bilibili_search.ydl_opts_fast
     assert "cookiefile" not in bilibili_search.ydl_opts_detail
+
+
+def test_search_api_uses_platform_stage_timeout_overrides():
+    searcher = YtDlpSearchApi(
+        platform="bilibili",
+        search_config={
+            "fast_search": {"socket_timeout": 30, "timeout_seconds": 45},
+            "detail_fetch": {"socket_timeout": 60, "timeout_seconds": 90},
+            "platforms": {
+                "bilibili": {
+                    "fast_search": {"timeout_seconds": 35},
+                    "detail_fetch": {"socket_timeout": 40, "timeout_seconds": 55},
+                },
+            },
+        },
+    )
+
+    assert searcher.fast_timeout_seconds == 35
+    assert searcher.detail_timeout_seconds == 55
+    assert searcher.ydl_opts_detail["socket_timeout"] == 40
+
+
+def test_search_fast_search_times_out(monkeypatch):
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def extract_info(self, query, download):
+            time.sleep(1)
+            return {"entries": [{"id": "late"}]}
+
+    monkeypatch.setattr(ytdlp_search_api.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+
+    searcher = YtDlpSearchApi(
+        platform="bilibili",
+        search_config={"fast_search": {"timeout_seconds": 0.01}},
+    )
+
+    with pytest.raises(SearchTimeoutError) as exc_info:
+        searcher._extract_fast_search("bilisearch1:test", "test")
+
+    assert exc_info.value.platform == "bilibili"
+    assert exc_info.value.stage == "fast_search"
+    assert exc_info.value.reason == "timeout"
 
 
 def test_downloader_handles_ignored_ytdlp_error_returning_none(monkeypatch):

@@ -1,6 +1,8 @@
 import random
 import copy
+import queue
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
@@ -24,6 +26,37 @@ class SearchNetworkError(Exception):
     pass
 
 
+class SearchCooldownTriggerError(Exception):
+    def __init__(self, message: str, platform: str, stage: str, reason: str):
+        super().__init__(message)
+        self.platform = platform
+        self.stage = stage
+        self.reason = reason
+
+
+class SearchTimeoutError(SearchCooldownTriggerError):
+    pass
+
+
+class SearchMaxRetriesExceededError(SearchCooldownTriggerError):
+    pass
+
+
+def _stage_config(search_config: dict, platform: str, stage: str) -> dict:
+    global_cfg = search_config.get(stage, {})
+    if not isinstance(global_cfg, dict):
+        global_cfg = {}
+    platform_cfg = search_config.get('platforms', {}).get(platform, {})
+    if not isinstance(platform_cfg, dict):
+        platform_cfg = {}
+    platform_stage_cfg = platform_cfg.get(stage, {})
+    if not isinstance(platform_stage_cfg, dict):
+        platform_stage_cfg = {}
+    merged = copy.deepcopy(global_cfg)
+    merged.update(copy.deepcopy(platform_stage_cfg))
+    return merged
+
+
 def _retry_policy(config: dict, default_attempts: int = 1) -> dict:
     backoff_cfg = config.get('backoff', {}) if isinstance(config.get('backoff'), dict) else {}
     return {
@@ -41,6 +74,19 @@ def _backoff_delay(policy: dict, attempt_index: int) -> float:
     if policy['jitter_seconds']:
         delay += random.uniform(0, policy['jitter_seconds'])
     return delay
+
+
+def _timeout_seconds(config: dict, default_seconds: float) -> float:
+    value = config.get(
+        'timeout_seconds',
+        config.get('operation_timeout_seconds', config.get('wall_timeout_seconds', default_seconds)),
+    )
+    return max(0.0, float(value))
+
+
+def _extract_info_direct(ydl_options: dict, target: str, download: bool) -> Optional[dict]:
+    with yt_dlp.YoutubeDL(ydl_options) as ydl:
+        return ydl.extract_info(target, download=download)
 
 
 def _log_anti_bot_wait(
@@ -87,10 +133,18 @@ class YtDlpSearchApi(SearchApi):
         if self.platform not in ['youtube', 'bilibili']:
             raise ValueError("platform must be 'youtube' or 'bilibili'")
 
-        fast_cfg = self.search_config.get('fast_search', {})
-        detail_cfg = self.search_config.get('detail_fetch', {})
+        fast_cfg = _stage_config(self.search_config, self.platform, 'fast_search')
+        detail_cfg = _stage_config(self.search_config, self.platform, 'detail_fetch')
         self.fast_retry_policy = _retry_policy(fast_cfg, default_attempts=1)
         self.detail_retry_policy = _retry_policy(detail_cfg, default_attempts=1)
+        self.fast_timeout_seconds = _timeout_seconds(
+            fast_cfg,
+            float(fast_cfg.get('socket_timeout', 30)) + 15,
+        )
+        self.detail_timeout_seconds = _timeout_seconds(
+            detail_cfg,
+            float(detail_cfg.get('socket_timeout', 60)) + 30,
+        )
         # 基础配置（用于快速搜索，extract_flat=True）
         self.ydl_opts_fast = {
             'quiet': True,
@@ -130,6 +184,47 @@ class YtDlpSearchApi(SearchApi):
         self.ydl_opts_detail['remote_components'] = ['ejs:github']
         # 详细模式可能需要更长的超时
         self.ydl_opts_detail['socket_timeout'] = detail_cfg.get('socket_timeout', 60)
+
+    def _extract_info_with_timeout(
+            self,
+            ydl_options: dict,
+            target: str,
+            stage: str,
+            timeout_seconds: float,
+            download: bool = False,
+    ) -> Optional[dict]:
+        if timeout_seconds <= 0:
+            return _extract_info_direct(ydl_options, target, download)
+
+        result_queue = queue.Queue(maxsize=1)
+
+        def run_extract() -> None:
+            try:
+                result_queue.put_nowait((True, _extract_info_direct(ydl_options, target, download)))
+            except BaseException as exc:
+                try:
+                    result_queue.put_nowait((False, exc))
+                except queue.Full:
+                    pass
+
+        thread = threading.Thread(
+            target=run_extract,
+            name=f"yt-dlp-{self.platform}-{stage}",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            ok, payload = result_queue.get(timeout=timeout_seconds)
+        except queue.Empty as exc:
+            raise SearchTimeoutError(
+                f"{stage} timed out after {timeout_seconds:.1f}s for {target}",
+                platform=self.platform,
+                stage=stage,
+                reason="timeout",
+            ) from exc
+        if ok:
+            return payload
+        raise payload
 
     def get_platform(self) -> str:
         return self.platform
@@ -192,7 +287,10 @@ class YtDlpSearchApi(SearchApi):
         details_by_url = {}
         if entry_with_urls:
             detail_workers = max(1, int(self.search_config.get('detail_workers', 5)))
-            with ThreadPoolExecutor(max_workers=detail_workers) as executor:
+            executor = ThreadPoolExecutor(max_workers=detail_workers)
+            cooldown_error = None
+            future_to_url = {}
+            try:
                 future_to_url = {
                     executor.submit(self._get_video_details, video_url): video_url
                     for _, video_url in entry_with_urls
@@ -201,6 +299,11 @@ class YtDlpSearchApi(SearchApi):
                     video_url = future_to_url[future]
                     try:
                         details_by_url[video_url] = future.result()
+                    except SearchCooldownTriggerError as e:
+                        logger.error(f"Platform cooldown triggered while fetching details for {video_url}: {e}")
+                        details_by_url[video_url] = None
+                        cooldown_error = e
+                        break
                     except Exception as e:
                         logger.error(f"Failed to get details for {video_url}: {e}")
                         details_by_url[video_url] = None
@@ -213,6 +316,15 @@ class YtDlpSearchApi(SearchApi):
                             details_by_url[video_url] = None
                             continue
                         raise
+            finally:
+                if cooldown_error:
+                    for future in future_to_url:
+                        future.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                else:
+                    executor.shutdown(wait=True)
+            if cooldown_error:
+                raise cooldown_error
 
         for entry, video_url in entry_with_urls:
             # 获取详细信息
@@ -260,17 +372,46 @@ class YtDlpSearchApi(SearchApi):
             restart_with_cookies = False
             for attempt in range(max_attempts):
                 ydl_options = self._options_for_search_attempt(self.ydl_opts_fast, use_cookies)
-                with yt_dlp.YoutubeDL(ydl_options) as ydl:
-                    try:
-                        info = ydl.extract_info(search_query, download=False)
-                        entries = info.get('entries', []) if info else []
-                        if not entries:
-                            logger.warning(f"No entries found for query '{query}'")
-                            return []
-                        return entries
-                    except (DownloadError, ExtractorError) as e:
-                        kind = self._classify_ytdlp_error(e)
-                        if kind == "anti_bot" and self._can_fallback_to_cookies(use_cookies):
+                try:
+                    info = self._extract_info_with_timeout(
+                        ydl_options,
+                        search_query,
+                        stage="fast_search",
+                        timeout_seconds=self.fast_timeout_seconds,
+                    )
+                    entries = info.get('entries', []) if info else []
+                    if not entries:
+                        logger.warning(f"No entries found for query '{query}'")
+                        return []
+                    return entries
+                except SearchTimeoutError as e:
+                    logger.error(
+                        "Fast search timed out for query '%s' on %s after %.1fs",
+                        query,
+                        self.platform,
+                        self.fast_timeout_seconds,
+                    )
+                    raise
+                except (DownloadError, ExtractorError) as e:
+                    kind = self._classify_ytdlp_error(e)
+                    if kind == "anti_bot" and self._can_fallback_to_cookies(use_cookies):
+                        _log_anti_bot_wait(
+                            stage="fast search",
+                            target=f"query '{query}'",
+                            platform=self.platform,
+                            attempt=attempt + 1,
+                            max_attempts=max_attempts,
+                            use_cookies=use_cookies,
+                            wait_seconds=0.0,
+                            action="retrying with cookie fallback",
+                            error=e,
+                        )
+                        use_cookies = True
+                        restart_with_cookies = True
+                        break
+                    if kind in {"rate_limit", "network", "anti_bot"} and attempt < max_attempts - 1:
+                        delay = _backoff_delay(policy, attempt)
+                        if kind == "anti_bot":
                             _log_anti_bot_wait(
                                 stage="fast search",
                                 target=f"query '{query}'",
@@ -278,70 +419,62 @@ class YtDlpSearchApi(SearchApi):
                                 attempt=attempt + 1,
                                 max_attempts=max_attempts,
                                 use_cookies=use_cookies,
-                                wait_seconds=0.0,
-                                action="retrying with cookie fallback",
+                                wait_seconds=delay,
+                                action="backing off before retry",
                                 error=e,
                             )
-                            use_cookies = True
-                            restart_with_cookies = True
-                            break
-                        if kind in {"rate_limit", "network", "anti_bot"} and attempt < max_attempts - 1:
-                            delay = _backoff_delay(policy, attempt)
-                            if kind == "anti_bot":
-                                _log_anti_bot_wait(
-                                    stage="fast search",
-                                    target=f"query '{query}'",
-                                    platform=self.platform,
-                                    attempt=attempt + 1,
-                                    max_attempts=max_attempts,
-                                    use_cookies=use_cookies,
-                                    wait_seconds=delay,
-                                    action="backing off before retry",
-                                    error=e,
-                                )
-                            else:
-                                logger.warning(
-                                    "Retryable fast search failure for query '%s' on %s "
-                                    "(kind=%s, attempt %s/%s, cookies=%s), backing off %.1fs: %s",
-                                    query,
-                                    self.platform,
-                                    kind,
-                                    attempt + 1,
-                                    max_attempts,
-                                    use_cookies,
-                                    delay,
-                                    e,
-                                )
-                            time.sleep(delay)
-                            continue
-                        if kind in {"rate_limit", "anti_bot"}:
-                            if kind == "anti_bot":
-                                logger.error(
-                                    "Anti-bot blocked fast search for query '%s' on %s; "
-                                    "anti_bot_wait_seconds=0.0; no retry attempt remains: %s",
-                                    query,
-                                    self.platform,
-                                    e,
-                                )
-                            else:
-                                logger.error(f"Rate limited or anti-bot blocked for query '{query}': {e}")
-                            raise SearchRateLimitError(str(e)) from e
-                        if kind == "network":
-                            logger.error(f"Network failure for query '{query}': {e}")
-                            raise SearchNetworkError(str(e)) from e
-                        logger.warning(f"No results or unsupported query '{query}': {e}")
-                        return []
-                    except Exception as e:
-                        logger.error(f"Unexpected fast search failure for query '{query}': {e}", exc_info=True)
-                        raise
-                    except BaseException as e:
-                        if isinstance(e, SystemExit):
+                        else:
                             logger.warning(
-                                f"yt-dlp exited during fast search for query '{query}' "
-                                f"(SystemExit code: {e.code!r})"
+                                "Retryable fast search failure for query '%s' on %s "
+                                "(kind=%s, attempt %s/%s, cookies=%s), backing off %.1fs: %s",
+                                query,
+                                self.platform,
+                                kind,
+                                attempt + 1,
+                                max_attempts,
+                                use_cookies,
+                                delay,
+                                e,
                             )
-                            return []
-                        raise
+                        time.sleep(delay)
+                        continue
+                    if kind in {"rate_limit", "network", "anti_bot"}:
+                        if kind == "anti_bot":
+                            logger.error(
+                                "Anti-bot blocked fast search for query '%s' on %s; "
+                                "anti_bot_wait_seconds=0.0; no retry attempt remains: %s",
+                                query,
+                                self.platform,
+                                e,
+                            )
+                        else:
+                            logger.error(
+                                "Retryable fast search failure exhausted for query '%s' on %s "
+                                "(kind=%s): %s",
+                                query,
+                                self.platform,
+                                kind,
+                                e,
+                            )
+                        raise SearchMaxRetriesExceededError(
+                            f"fast_search exhausted {max_attempts} attempt(s) for {query}: {e}",
+                            platform=self.platform,
+                            stage="fast_search",
+                            reason=kind,
+                        ) from e
+                    logger.warning(f"No results or unsupported query '{query}': {e}")
+                    return []
+                except Exception as e:
+                    logger.error(f"Unexpected fast search failure for query '{query}': {e}", exc_info=True)
+                    raise
+                except BaseException as e:
+                    if isinstance(e, SystemExit):
+                        logger.warning(
+                            f"yt-dlp exited during fast search for query '{query}' "
+                            f"(SystemExit code: {e.code!r})"
+                        )
+                        return []
+                    raise
             if restart_with_cookies:
                 continue
             return []
@@ -358,13 +491,42 @@ class YtDlpSearchApi(SearchApi):
             restart_with_cookies = False
             for attempt in range(max_attempts):
                 ydl_options = self._options_for_search_attempt(self.ydl_opts_detail, use_cookies)
-                with yt_dlp.YoutubeDL(ydl_options) as ydl:
-                    try:
-                        info = ydl.extract_info(url, download=False)
-                        return info
-                    except (DownloadError, ExtractorError) as e:
-                        kind = self._classify_ytdlp_error(e)
-                        if kind == "anti_bot" and self._can_fallback_to_cookies(use_cookies):
+                try:
+                    info = self._extract_info_with_timeout(
+                        ydl_options,
+                        url,
+                        stage="detail_fetch",
+                        timeout_seconds=self.detail_timeout_seconds,
+                    )
+                    return info
+                except SearchTimeoutError:
+                    logger.error(
+                        "Detail fetch timed out for %s on %s after %.1fs",
+                        url,
+                        self.platform,
+                        self.detail_timeout_seconds,
+                    )
+                    raise
+                except (DownloadError, ExtractorError) as e:
+                    kind = self._classify_ytdlp_error(e)
+                    if kind == "anti_bot" and self._can_fallback_to_cookies(use_cookies):
+                        _log_anti_bot_wait(
+                            stage="detail fetch",
+                            target=url,
+                            platform=self.platform,
+                            attempt=attempt + 1,
+                            max_attempts=max_attempts,
+                            use_cookies=use_cookies,
+                            wait_seconds=0.0,
+                            action="retrying with cookie fallback",
+                            error=e,
+                        )
+                        use_cookies = True
+                        restart_with_cookies = True
+                        break
+                    if kind in {"rate_limit", "network", "anti_bot"} and attempt < max_attempts - 1:
+                        delay = _backoff_delay(policy, attempt)
+                        if kind == "anti_bot":
                             _log_anti_bot_wait(
                                 stage="detail fetch",
                                 target=url,
@@ -372,44 +534,26 @@ class YtDlpSearchApi(SearchApi):
                                 attempt=attempt + 1,
                                 max_attempts=max_attempts,
                                 use_cookies=use_cookies,
-                                wait_seconds=0.0,
-                                action="retrying with cookie fallback",
+                                wait_seconds=delay,
+                                action="backing off before retry",
                                 error=e,
                             )
-                            use_cookies = True
-                            restart_with_cookies = True
-                            break
-                        if kind in {"rate_limit", "network", "anti_bot"} and attempt < max_attempts - 1:
-                            delay = _backoff_delay(policy, attempt)
-                            if kind == "anti_bot":
-                                _log_anti_bot_wait(
-                                    stage="detail fetch",
-                                    target=url,
-                                    platform=self.platform,
-                                    attempt=attempt + 1,
-                                    max_attempts=max_attempts,
-                                    use_cookies=use_cookies,
-                                    wait_seconds=delay,
-                                    action="backing off before retry",
-                                    error=e,
-                                )
-                            else:
-                                logger.warning(
-                                    "Retryable detail fetch failure for %s "
-                                    "(kind=%s, attempt %s/%s, cookies=%s), backing off %.1fs: %s",
-                                    url,
-                                    kind,
-                                    attempt + 1,
-                                    max_attempts,
-                                    use_cookies,
-                                    delay,
-                                    e,
-                                )
-                            time.sleep(delay)
-                            continue
-                        if kind == "network":
-                            logger.error(f"Network error while fetching details for {url}: {e}")
-                        elif kind == "anti_bot":
+                        else:
+                            logger.warning(
+                                "Retryable detail fetch failure for %s "
+                                "(kind=%s, attempt %s/%s, cookies=%s), backing off %.1fs: %s",
+                                url,
+                                kind,
+                                attempt + 1,
+                                max_attempts,
+                                use_cookies,
+                                delay,
+                                e,
+                            )
+                        time.sleep(delay)
+                        continue
+                    if kind in {"rate_limit", "network", "anti_bot"}:
+                        if kind == "anti_bot":
                             logger.error(
                                 "Anti-bot blocked detail fetch for %s on %s; "
                                 "anti_bot_wait_seconds=0.0; no retry attempt remains: %s",
@@ -417,22 +561,34 @@ class YtDlpSearchApi(SearchApi):
                                 self.platform,
                                 e,
                             )
-                        elif kind == "rate_limit":
-                            logger.error(f"Rate limit or anti-bot while fetching details for {url}: {e}")
                         else:
-                            logger.warning(f"No detail result for {url}: {e}")
-                        return None
-                    except Exception as e:
-                        logger.error(f"Unexpected error getting details for {url}: {e}", exc_info=True)
-                        return None
-                    except BaseException as e:
-                        if isinstance(e, SystemExit):
-                            logger.warning(
-                                f"yt-dlp exited while fetching details for {url} "
-                                f"(SystemExit code: {e.code!r})"
+                            logger.error(
+                                "Retryable detail fetch failure exhausted for %s on %s "
+                                "(kind=%s): %s",
+                                url,
+                                self.platform,
+                                kind,
+                                e,
                             )
-                            return None
-                        raise
+                        raise SearchMaxRetriesExceededError(
+                            f"detail_fetch exhausted {max_attempts} attempt(s) for {url}: {e}",
+                            platform=self.platform,
+                            stage="detail_fetch",
+                            reason=kind,
+                        ) from e
+                    logger.warning(f"No detail result for {url}: {e}")
+                    return None
+                except Exception as e:
+                    logger.error(f"Unexpected error getting details for {url}: {e}", exc_info=True)
+                    return None
+                except BaseException as e:
+                    if isinstance(e, SystemExit):
+                        logger.warning(
+                            f"yt-dlp exited while fetching details for {url} "
+                            f"(SystemExit code: {e.code!r})"
+                        )
+                        return None
+                    raise
             if restart_with_cookies:
                 continue
             return None
