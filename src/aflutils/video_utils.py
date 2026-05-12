@@ -1,10 +1,13 @@
 import os
+import json
 import shutil
 import subprocess
 import sys
 import tempfile
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -35,8 +38,23 @@ FFPROBE = _find_ffprobe()
 logger = get_logger(__name__)
 
 
+@dataclass(frozen=True)
+class VideoInfo:
+    codec_name: Optional[str]
+    pix_fmt: Optional[str]
+    width: int
+    height: int
+    fps: float
+    duration: float
+    frame_count: int
+    has_audio: bool
+    color_space: Optional[str] = None
+    color_transfer: Optional[str] = None
+    color_primaries: Optional[str] = None
+
+
 def get_cuda_lib_path() -> str:
-    """Build an LD_LIBRARY_PATH that exposes conda CUDA libs and WSL libcuda."""
+    """Build an LD_LIBRARY_PATH that exposes CUDA libs without forcing conda system libs."""
     paths = []
 
     paths.append("/usr/lib/wsl/lib")
@@ -52,10 +70,6 @@ def get_cuda_lib_path() -> str:
                 if candidate.is_dir():
                     paths.append(str(candidate))
 
-    current = os.environ.get("LD_LIBRARY_PATH", "")
-    if current:
-        paths.extend(path for path in current.split(":") if path)
-
     deduped = []
     seen = set()
     for path in paths:
@@ -66,23 +80,175 @@ def get_cuda_lib_path() -> str:
     return ":".join(deduped)
 
 
+def _build_ffmpeg_env(use_cuda_libs: bool = False) -> dict:
+    """Return a subprocess environment for ffmpeg/ffprobe.
+
+    Plain ffmpeg/ffprobe commands should not inherit conda's LD_LIBRARY_PATH because
+    system ffmpeg can otherwise load incompatible ncurses/tinfo libraries. CUDA/NVENC
+    calls get the CUDA paths prepended only when they need them.
+    """
+    env = dict(os.environ)
+    if not use_cuda_libs:
+        env.pop("LD_LIBRARY_PATH", None)
+        return env
+
+    cuda_path = get_cuda_lib_path()
+    current = os.environ.get("LD_LIBRARY_PATH", "")
+    current_cuda_paths = [
+        path for path in current.split(":")
+        if path and any(marker in path.lower() for marker in ("cuda", "nvidia", "wsl/lib"))
+    ]
+    paths = [path for path in [cuda_path, *current_cuda_paths] if path]
+    if paths:
+        env["LD_LIBRARY_PATH"] = ":".join(paths)
+    return env
+
+
 def _build_cuda_env() -> dict:
-    return {**os.environ, "LD_LIBRARY_PATH": get_cuda_lib_path()}
+    return _build_ffmpeg_env(use_cuda_libs=True)
+
+
+def _run_command(cmd: List[str], timeout: int = 300, use_cuda_libs: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=_build_ffmpeg_env(use_cuda_libs=use_cuda_libs),
+    )
+
+
+def _run_ffmpeg(cmd: List[str], timeout: int = 300, use_cuda_libs: bool = False) -> subprocess.CompletedProcess:
+    return _run_command(cmd, timeout=timeout, use_cuda_libs=use_cuda_libs)
+
+
+def _stderr_tail(stderr: str, max_chars: int = 4000) -> str:
+    if not stderr:
+        return ""
+    return stderr if len(stderr) <= max_chars else stderr[-max_chars:]
+
+
+def _validate_output_file(path: str, description: str) -> None:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError(f"{description}生成失败或文件为空")
+
+
+def _remove_partial_output(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.unlink(path)
+    except OSError as e:
+        logger.warning(f"Failed to remove partial output {path}: {e}")
+
+
+@lru_cache(maxsize=16)
+def _ffmpeg_has_encoder(encoder: str) -> bool:
+    try:
+        result = _run_command([FFMPEG, "-hide_banner", "-encoders"], timeout=10)
+        if result.returncode != 0:
+            return False
+        return encoder in result.stdout
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
+def _has_nvidia_gpu() -> bool:
+    try:
+        result = _run_command(["nvidia-smi"], timeout=10)
+        return result.returncode == 0
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+
+
+def _can_try_h264_nvenc() -> bool:
+    return _has_nvidia_gpu() and _ffmpeg_has_encoder("h264_nvenc")
 
 
 def _check_ffmpeg_cuda_support() -> bool:
-    """Check if the ffmpeg binary supports CUDA/NVENC."""
+    """Backward-compatible CUDA/NVENC capability check."""
+    return _can_try_h264_nvenc()
+
+
+def _parse_fps(value: Optional[str]) -> float:
+    if not value or value == "0/0":
+        return 0.0
+    if "/" in value:
+        numerator, denominator = value.split("/", 1)
+        try:
+            denominator_value = float(denominator)
+            if denominator_value == 0:
+                return 0.0
+            return float(numerator) / denominator_value
+        except (TypeError, ValueError):
+            return 0.0
     try:
-        result = subprocess.run(
-            [FFMPEG, "-encoders"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env=_build_cuda_env(),
-        )
-        return 'nvenc' in result.stdout or 'cuda' in result.stdout
-    except Exception:
-        return False
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def probe_video(video_path: str) -> Optional[VideoInfo]:
+    """Return basic video/audio metadata from ffprobe."""
+    cmd = [
+        FFPROBE, "-v", "error",
+        "-show_streams",
+        "-show_format",
+        "-of", "json",
+        video_path,
+    ]
+    try:
+        result = _run_command(cmd, timeout=20)
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        logger.warning(f"ffprobe failed for {video_path}: {e}")
+        return None
+    if result.returncode != 0:
+        logger.warning(f"ffprobe failed for {video_path}: {_stderr_tail(result.stderr)}")
+        return None
+
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as e:
+        logger.warning(f"Invalid ffprobe JSON for {video_path}: {e}")
+        return None
+
+    streams = payload.get("streams", [])
+    video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+    if not video_stream:
+        return None
+
+    format_info = payload.get("format", {})
+    fps = _parse_fps(video_stream.get("avg_frame_rate")) or _parse_fps(video_stream.get("r_frame_rate"))
+
+    duration = 0.0
+    for raw_duration in (video_stream.get("duration"), format_info.get("duration")):
+        try:
+            if raw_duration is not None:
+                duration = float(raw_duration)
+                break
+        except (TypeError, ValueError):
+            continue
+
+    try:
+        frame_count = int(video_stream.get("nb_frames") or 0)
+    except (TypeError, ValueError):
+        frame_count = 0
+    if frame_count <= 0 and fps > 0 and duration > 0:
+        frame_count = int(round(fps * duration))
+
+    return VideoInfo(
+        codec_name=(video_stream.get("codec_name") or "").lower() or None,
+        pix_fmt=(video_stream.get("pix_fmt") or "").lower() or None,
+        width=int(video_stream.get("width") or 0),
+        height=int(video_stream.get("height") or 0),
+        fps=fps,
+        duration=duration,
+        frame_count=frame_count,
+        has_audio=any(stream.get("codec_type") == "audio" for stream in streams),
+        color_space=video_stream.get("color_space"),
+        color_transfer=video_stream.get("color_transfer"),
+        color_primaries=video_stream.get("color_primaries"),
+    )
 
 
 def sample_video_per_sec(input_path: str, suffix: str = "_sample", output_ext: str = ".mp4") -> str:
@@ -110,55 +276,70 @@ def sample_video_per_sec(input_path: str, suffix: str = "_sample", output_ext: s
     output_path = os.path.join(base_dir, f"{base_name}{suffix}{output_ext}")
 
     try:
-        # 检查 ffmpeg 是否可用
-        subprocess.run(
-            [FFMPEG, "-version"],
-            capture_output=True,
-            check=True,
-            timeout=10,
-            env=_build_cuda_env(),
-        )
+        result = _run_command([FFMPEG, "-version"], timeout=10)
+        if result.returncode != 0:
+            raise FileNotFoundError
     except (subprocess.SubprocessError, FileNotFoundError):
         raise FileNotFoundError("未找到 ffmpeg，请确保已安装并加入 PATH")
 
-    # Detect CUDA support
-    has_cuda = _check_ffmpeg_cuda_support()
-
-    # 构建 ffmpeg 命令
-    if has_cuda:
-        cmd = [
+    vf = "fps=1,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
+    attempts = []
+    if _can_try_h264_nvenc():
+        attempts.append((
+            "h264_nvenc",
+            [
+                FFMPEG, "-y",
+                "-i", input_path,
+                "-vf", vf,
+                "-an",
+                "-c:v", "h264_nvenc",
+                "-preset", "p1",
+                "-cq", "23",
+                output_path,
+            ],
+            True,
+        ))
+    attempts.append((
+        "libx264",
+        [
             FFMPEG, "-y",
-            "-hwaccel", "cuda",
             "-i", input_path,
-            "-vf", "fps=1",
+            "-vf", vf,
             "-an",
-            "-c:v", "h264_nvenc",
-            "-preset", "p1",
-            "-cq", "23",
-            output_path
-        ]
-    else:
-        cmd = [
-            FFMPEG, "-y",
-            "-i", input_path,
-            "-vf", "fps=1",
-            "-an",
-            output_path
-        ]
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            output_path,
+        ],
+        False,
+    ))
 
-    # 执行抽取和合并
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=_build_cuda_env())
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg 执行失败 (返回码 {result.returncode}):\n{result.stderr}")
+    errors = []
+    for label, cmd, use_cuda_libs in attempts:
+        result = _run_ffmpeg(cmd, timeout=300, use_cuda_libs=use_cuda_libs)
+        if result.returncode == 0:
+            try:
+                _validate_output_file(output_path, "sample 视频")
+                if label != "h264_nvenc":
+                    logger.info(f"sample_video_per_sec used {label} for {input_path}")
+                return output_path
+            except RuntimeError as e:
+                errors.append(f"{label}: {e}")
+                _remove_partial_output(output_path)
+                continue
 
-    # 检查生成的文件是否有效（大小 > 0）
-    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-        raise RuntimeError("sample 视频生成失败或文件为空")
+        errors.append(f"{label} 返回码 {result.returncode}:\n{_stderr_tail(result.stderr)}")
+        _remove_partial_output(output_path)
+        if label == "h264_nvenc":
+            logger.warning(f"h264_nvenc sample generation failed for {input_path}; falling back to libx264")
 
-    return output_path
+    raise RuntimeError(f"ffmpeg 执行失败，sample 视频生成失败:\n" + "\n\n".join(errors))
 
 
 def get_video_fps(video_path: str) -> float:
+    info = probe_video(video_path)
+    if info and info.fps > 0:
+        return info.fps
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
@@ -166,6 +347,9 @@ def get_video_fps(video_path: str) -> float:
 
 
 def get_video_frames(video_path: str) -> float:
+    info = probe_video(video_path)
+    if info and info.frame_count > 0:
+        return info.frame_count
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
@@ -173,6 +357,9 @@ def get_video_frames(video_path: str) -> float:
 
 
 def get_video_secs(video_path: str) -> float:
+    info = probe_video(video_path)
+    if info and info.duration > 0:
+        return info.duration
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -277,15 +464,7 @@ def clip_video(video_path: str, segments: List[Tuple], unit: str = "frame", max_
         logger.error(f"Invalid fps for {video_path}")
         return []
 
-    # 获取视频编码格式（用于选择硬件加速器）
-    codec_name = _get_video_codec(video_path)
-    if not codec_name:
-        logger.warning(f"Cannot detect codec of {video_path}, fallback to software encoding")
-        use_cuda = False
-    else:
-        use_cuda = _is_cuda_supported(codec_name)
-
-    base, ext = os.path.splitext(video_path)
+    base, _ = os.path.splitext(video_path)
 
     # 辅助函数：根据单位计算起始/结束时间（秒）
     def get_times(seg: Tuple) -> Tuple[float, float]:
@@ -308,11 +487,9 @@ def clip_video(video_path: str, segments: List[Tuple], unit: str = "frame", max_
             logger.error(f"Segment {idx}: {e}")
             return None
 
-        output_path = f"{base}_clipped_{idx}{ext}"
-        success = False
+        output_path = f"{base}_clipped_{idx}.mkv"
 
-        if use_cuda:
-            success = _clip_with_cuda(video_path, start_time, end_time, output_path)
+        success = _clip_with_copy(video_path, start_time, end_time, output_path)
         if not success:
             success = _clip_with_software(video_path, start_time, end_time, output_path)
 
@@ -344,32 +521,11 @@ def clip_video(video_path: str, segments: List[Tuple], unit: str = "frame", max_
 
 def _get_video_codec(video_path: str) -> Optional[str]:
     """使用 ffprobe 获取视频流的编码名称，如 h264、hevc"""
-    cmd = [
-        FFPROBE, "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name",
-        "-of", "default=noprint_wrappers=1:nokey=1", video_path
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        codec = result.stdout.strip().lower()
-        return codec if codec else None
-    except subprocess.CalledProcessError:
-        return None
+    info = probe_video(video_path)
+    return info.codec_name if info else None
 
 
-def _is_cuda_supported(codec: str) -> bool:
-    """检查系统是否支持 CUDA 硬件加速且视频编码为 H.264 或 HEVC"""
-    # 检查 NVIDIA GPU 是否存在（简单方法：运行 nvidia-smi）
-    try:
-        subprocess.run(["nvidia-smi"], capture_output=True, check=True)
-    except (subprocess.SubprocessError, FileNotFoundError):
-        return False
-    # 可选：进一步检查 ffmpeg 是否支持对应的 cuvid/nvenc 解码器
-    # 这里假设标准 ffmpeg 版本已支持，若不支持则在 _clip_with_cuda 中会失败并回退
-    return True
-
-
-def _clip_with_cuda(video_path: str, start: float, end: float, output: str) -> bool:
+def _clip_with_copy(video_path: str, start: float, end: float, output: str) -> bool:
     """使用关键帧流复制进行剪辑（不重新编码）。"""
     # 无损流复制 + 关键帧剪辑：
     # -ss 放在 -i 前做关键帧级 seek（速度快，不解码）
@@ -389,39 +545,43 @@ def _clip_with_cuda(video_path: str, start: float, end: float, output: str) -> b
         output,
         "-y"
     ]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, env=_build_cuda_env())
+    result = _run_ffmpeg(cmd, timeout=300)
+    if result.returncode == 0:
+        try:
+            _validate_output_file(output, "clip 视频")
+        except RuntimeError as e:
+            logger.warning(f"Copy clipping produced invalid output for {video_path}: {e}")
+            _remove_partial_output(output)
+            return False
         return True
-    except subprocess.CalledProcessError as e:
-        logger.error(f"CUDA clipping error: {e.stderr}")
-        return False
+    logger.warning(f"Copy clipping failed for {video_path}: {_stderr_tail(result.stderr)}")
+    _remove_partial_output(output)
+    return False
 
 
 def _clip_with_software(video_path: str, start: float, end: float, output: str) -> bool:
-    """使用软件编码（libx264/libx265）进行剪辑（重新编码）"""
-    # 检测原视频编码以决定软件编码器
-    codec = _get_video_codec(video_path)
-    if codec in ("hevc", "h265"):
-        vcodec = "libx265"
-        crf = "28"  # x265 的 CRF 默认值稍高
-    else:
-        vcodec = "libx264"
-        crf = "23"
-
+    """使用软件编码（libx264）进行兼容性剪辑。"""
     cmd = [
         FFMPEG, "-i", video_path,
         "-ss", str(start), "-to", str(end),
-        "-c:v", vcodec, "-crf", crf, "-preset", "fast",
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+        "-c:v", "libx264", "-crf", "23", "-preset", "fast",
         "-c:a", "copy",
         "-avoid_negative_ts", "make_zero",
         output, "-y"
     ]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, env=_build_cuda_env())
+    result = _run_ffmpeg(cmd, timeout=300)
+    if result.returncode == 0:
+        try:
+            _validate_output_file(output, "clip 视频")
+        except RuntimeError as e:
+            logger.error(f"Software clipping produced invalid output for {video_path}: {e}")
+            _remove_partial_output(output)
+            return False
         return True
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Software clipping error: {e.stderr}")
-        return False
+    logger.error(f"Software clipping error: {_stderr_tail(result.stderr)}")
+    _remove_partial_output(output)
+    return False
 
 
 def remove_videos(video_paths: List[str]) -> None:
@@ -443,146 +603,24 @@ def remove_videos(video_paths: List[str]) -> None:
             logger.warning(f"Failed to remove video {video_path}: {e}")
 
 
-#
-# def clip_video(video_path: str, segments: List[Tuple], unit: str = "frame") -> Optional[str]:
-#     """
-#     根据帧号或时间范围剪切视频，合并多个片段，输出到同一文件夹下（文件名加 _clipped 后缀）。
-#
-#     :param video_path: 原视频路径
-#     :param segments: 列表，每个元素为 (start, end)，包含起始和结束。
-#                      当 unit="frame" 时，start/end 为整数帧号（闭区间）；
-#                      当 unit="second" 时，start/end 为浮点数秒数（闭区间，包含结束时刻的帧）。
-#     :param unit: 单位类型，"frame" 或 "second"，默认 "frame"
-#     :return: 剪切后的视频路径，失败返回 None
-#     """
-#     if not segments:
-#         logger.warning(f"No segments to clip for {video_path}")
-#         return video_path  # 无剪辑必要，返回原路径
-#
-#     # 获取帧率
-#     cap = cv2.VideoCapture(video_path)
-#     fps = cap.get(cv2.CAP_PROP_FPS)
-#     cap.release()
-#     if fps <= 0:
-#         logger.error(f"Invalid fps for {video_path}")
-#         return None
-#
-#     # 生成输出路径
-#     base, ext = os.path.splitext(video_path)
-#     output_path = f"{base}_clipped{ext}"
-#
-#     # 辅助函数：根据单位计算起始/结束时间（秒）
-#     def get_times(seg: Tuple) -> Tuple[float, float]:
-#         start_val, end_val = seg
-#         if unit == "frame":
-#             start_time = start_val / fps
-#             end_time = (end_val + 1) / fps  # 包含结束帧
-#         elif unit == "second":
-#             start_time = start_val
-#             end_time = end_val + (1.0 / fps)  # 包含结束时刻的帧
-#         else:
-#             raise ValueError(f"不支持的 unit 参数: {unit}，请使用 'frame' 或 'second'")
-#         return start_time, end_time
-#
-#     # 如果只有一个片段，直接剪辑
-#     if len(segments) == 1:
-#         try:
-#             start_time, end_time = get_times(segments[0])
-#         except ValueError as e:
-#             logger.error(str(e))
-#             return None
-#
-#         cmd = [
-#             FFMPEG, "-i", video_path,
-#             "-ss", str(start_time),
-#             "-to", str(end_time),
-#             "-c", "copy",  # 快速复制，不重新编码
-#             "-avoid_negative_ts", "make_zero",
-#             output_path, "-y"
-#         ]
-#         try:
-#             subprocess.run(cmd, check=True, capture_output=True, text=True)
-#             logger.info(f"Clipped video saved to {output_path}")
-#             return output_path
-#         except subprocess.CalledProcessError as e:
-#             logger.error(f"FFmpeg error: {e.stderr}")
-#             return None
-#
-#     # 多个片段：分别剪辑到临时文件，然后合并
-#     temp_files = []
-#     try:
-#         for i, seg in enumerate(segments):
-#             start_time, end_time = get_times(seg)
-#             temp_fd, temp_path = tempfile.mkstemp(suffix=f"_seg{i}{ext}", prefix="clip_")
-#             os.close(temp_fd)
-#             cmd = [
-#                 FFMPEG, "-i", video_path,
-#                 "-ss", str(start_time),
-#                 "-to", str(end_time),
-#                 "-c", "copy",
-#                 "-avoid_negative_ts", "make_zero",
-#                 temp_path, "-y"
-#             ]
-#             subprocess.run(cmd, check=True, capture_output=True, text=True)
-#             temp_files.append(temp_path)
-#
-#         # 创建 concat 文件列表
-#         concat_file = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
-#         for temp_path in temp_files:
-#             # 转义特殊字符（例如单引号）
-#             escaped = temp_path.replace("'", "'\\''")
-#             concat_file.write(f"file '{escaped}'\n")
-#         concat_file.close()
-#
-#         # 使用 concat 协议合并
-#         cmd_concat = [
-#             FFMPEG, "-f", "concat", "-safe", "0",
-#             "-i", concat_file.name,
-#             "-c", "copy",
-#             output_path, "-y"
-#         ]
-#         subprocess.run(cmd_concat, check=True, capture_output=True, text=True)
-#         logger.info(f"Merged clipped video saved to {output_path}")
-#         return output_path
-#     except subprocess.CalledProcessError as e:
-#         logger.error(f"FFmpeg error during clipping/merging: {e.stderr}")
-#         return None
-#     except ValueError as e:
-#         logger.error(str(e))
-#         return None
-#     finally:
-#         # 清理临时文件
-#         for temp_path in temp_files:
-#             try:
-#                 os.unlink(temp_path)
-#             except OSError:
-#                 pass
-#         if 'concat_file' in locals():
-#             try:
-#                 os.unlink(concat_file.name)
-#             except OSError:
-#                 pass
-
-
 def check_audio(video_path: str) -> bool:
     """使用 ffprobe 检查是否有音频流"""
-    try:
-        cmd = [
-            FFPROBE, '-v', 'error', '-select_streams', 'a:0',
-            '-show_entries', 'stream=codec_type', '-of', 'default=noprint_wrappers=1:nokey=1',
-            video_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        return result.returncode == 0 and result.stdout.strip() == 'audio'
-    except Exception as e:
-        logger.error(f"Audio check failed: {e}")
-        return False
+    info = probe_video(video_path)
+    return bool(info and info.has_audio)
 
 
 def extract_audio(audio_path: str, video_path: str):
-    cmd = [FFMPEG, '-hwaccel', 'cuda', '-i', video_path, '-ac', '1', '-ar',
-           '16000', '-y', audio_path]
-    subprocess.run(cmd, capture_output=True, check=True, env=_build_cuda_env())
+    cmd = [
+        FFMPEG, '-i', video_path,
+        '-vn',
+        '-ac', '1',
+        '-ar', '16000',
+        '-y', audio_path,
+    ]
+    result = _run_ffmpeg(cmd, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg 音频提取失败 (返回码 {result.returncode}):\n{_stderr_tail(result.stderr)}")
+    _validate_output_file(audio_path, "audio")
 
 
 def concat_videos(video_paths: List[str]) -> Optional[str]:
@@ -630,9 +668,15 @@ def _concat_with_copy(video_paths: List[str], output_path: str) -> bool:
             "-c", "copy",
             output_path, "-y"
         ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True, env=_build_cuda_env())
+        result = _run_ffmpeg(cmd, timeout=300)
+        if result.returncode != 0:
+            logger.warning(f"Concat copy failed: {_stderr_tail(result.stderr)}")
+            _remove_partial_output(output_path)
+            return False
+        _validate_output_file(output_path, "concat 视频")
         return True
-    except subprocess.CalledProcessError:
+    except RuntimeError as e:
+        logger.warning(f"Concat copy produced invalid output: {e}")
         # 流复制失败（如编码/尺寸不一致），删除可能产生的半成品
         if os.path.exists(output_path):
             os.unlink(output_path)
@@ -654,14 +698,21 @@ def _concat_with_reencode(video_paths: List[str], output_path: str) -> bool:
         cmd = [
             FFMPEG, "-f", "concat", "-safe", "0",
             "-i", list_file,
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
             "-c:v", "libx264", "-preset", "fast", "-crf", "23",
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             output_path, "-y"
         ]
-        subprocess.run(cmd, check=True, capture_output=True, text=True, env=_build_cuda_env())
+        result = _run_ffmpeg(cmd, timeout=600)
+        if result.returncode != 0:
+            logger.error(f"Concat reencode failed: {_stderr_tail(result.stderr)}")
+            _remove_partial_output(output_path)
+            return False
+        _validate_output_file(output_path, "concat 视频")
         return True
-    except subprocess.CalledProcessError:
+    except RuntimeError as e:
+        logger.error(f"Concat reencode produced invalid output: {e}")
         if os.path.exists(output_path):
             os.unlink(output_path)
         return False
