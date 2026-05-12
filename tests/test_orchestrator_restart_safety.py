@@ -1,5 +1,6 @@
 import sqlite3
 from types import SimpleNamespace
+from pathlib import Path
 
 from core.models.video_meta import VideoMeta
 from core.storage.video_store import VideoStore
@@ -227,6 +228,22 @@ def test_resumes_from_checkpoint_stage_as_next_stage(video_store, monkeypatch):
     events = []
     patch_orchestrator(monkeypatch, events)
     video_store.create_pipeline_run("crashed-run", stage="download")
+    video_store.enqueue_download_candidate(make_video("queued-download"))
+
+    def valid_file_path(path_name: str) -> str:
+        path = Path(video_store.db_path).parent / path_name
+        path.write_text("video")
+        return str(path)
+
+    class FileCreatingDownloader:
+        def __init__(self, config_dict=None):
+            events.append("downloader:init:file")
+
+        def download(self, urls):
+            events.append("download")
+            return {url: valid_file_path(f"{index}.mp4") for index, url in enumerate(urls)}
+
+    monkeypatch.setattr(orchestrator, "DefaultDownloader", FileCreatingDownloader)
 
     orchestrator.run_pipeline(pipeline_config(video_store))
 
@@ -236,8 +253,23 @@ def test_resumes_from_checkpoint_stage_as_next_stage(video_store, monkeypatch):
     assert "search:youtube" not in events
     assert "search:bilibili" not in events
     assert "download" in events
-    assert "v1" in events
+    assert "v1" not in events
     assert "v2:start" in events
+
+
+def test_resume_download_with_empty_queue_and_downloaded_rows_advances_to_v2(video_store, monkeypatch):
+    events = []
+    patch_orchestrator(monkeypatch, events)
+    video_store.create_pipeline_run("crashed-run", stage="download")
+    video_store.insert_or_update(make_video("already-downloaded"), file_path="/tmp/already.mp4")
+
+    orchestrator.run_pipeline(pipeline_config(video_store))
+
+    run = video_store.get_run_by_id("crashed-run")
+    assert run["stage"] == "v2"
+    assert run["status"] == "completed"
+    assert "search:youtube" not in events
+    assert "download" not in events
 
 
 def test_invalid_resume_stage_restarts_from_search(video_store, monkeypatch):
@@ -275,4 +307,94 @@ def test_failed_downloads_are_not_enqueued_for_v2(video_store, monkeypatch):
         rows = conn.execute("SELECT video_id, file_path, status FROM videos").fetchall()
 
     assert rows == []
+    assert video_store.get_download_queue_count() == 2
     assert "download:failed" in events
+
+
+def test_v1_filters_before_download(video_store, monkeypatch):
+    events = []
+    patch_orchestrator(monkeypatch, events)
+
+    class SelectivePreFilter:
+        def __init__(self, config):
+            events.append("v1:init:selective")
+
+        def filter(self, videos, search_term):
+            events.append("v1")
+            passed = [video for video in videos if video.platform == "youtube"]
+            return passed, {
+                "search_term": search_term,
+                "v1_pass_rate": len(passed) / len(videos),
+                "fail_reasons": {},
+                "total_received": len(videos),
+            }
+
+    class FileCreatingDownloader:
+        def __init__(self, config_dict=None):
+            events.append("downloader:init:file")
+
+        def download(self, urls):
+            events.append(f"download:{urls[0]}")
+            path = Path(video_store.db_path).parent / f"{len(events)}.mp4"
+            path.write_text("video")
+            return {urls[0]: str(path)}
+
+    monkeypatch.setattr(orchestrator, "PreFilter", SelectivePreFilter)
+    monkeypatch.setattr(orchestrator, "DefaultDownloader", FileCreatingDownloader)
+
+    config = pipeline_config(video_store)
+    config["pipeline"]["enable_v2"] = False
+    orchestrator.run_pipeline(config)
+
+    download_events = [event for event in events if event.startswith("download:")]
+    assert len(download_events) == 1
+    assert "youtube" in download_events[0]
+    assert events.index("v1") < events.index(download_events[0])
+
+    rows = video_store.get_pending_videos(limit=10)
+    assert [row["platform"] for row in rows] == ["youtube"]
+    assert video_store.get_download_queue_count() == 0
+
+
+def test_each_successful_download_is_inserted_before_next_download(video_store, monkeypatch):
+    events = []
+    patch_orchestrator(monkeypatch, events)
+
+    class TwoVideoSearcher:
+        def __init__(self, platform, **kwargs):
+            self.platform = platform
+            events.append(f"searcher:init:{platform}")
+
+        def search(self, query, max_results=20):
+            events.append(f"search:{self.platform}")
+            if self.platform != "youtube":
+                return []
+            return [make_video("first"), make_video("second")]
+
+    class FileCreatingDownloader:
+        def __init__(self, config_dict=None):
+            self.calls = 0
+            events.append("downloader:init:file")
+
+        def download(self, urls):
+            self.calls += 1
+            if self.calls == 2:
+                first = video_store.get_video_by_id("first", "youtube")
+                assert first is not None
+                assert first["status"] == "downloaded"
+            events.append(f"download:{self.calls}")
+            path = Path(video_store.db_path).parent / f"immediate-{self.calls}.mp4"
+            path.write_text("video")
+            return {urls[0]: str(path)}
+
+    monkeypatch.setattr(orchestrator, "YtDlpSearchApi", TwoVideoSearcher)
+    monkeypatch.setattr(orchestrator, "DefaultDownloader", FileCreatingDownloader)
+
+    config = pipeline_config(video_store)
+    config["pipeline"]["enable_v2"] = False
+    orchestrator.run_pipeline(config)
+
+    assert "download:1" in events
+    assert "download:2" in events
+    assert video_store.get_video_by_id("first", "youtube")["status"] == "downloaded"
+    assert video_store.get_video_by_id("second", "youtube")["status"] == "downloaded"

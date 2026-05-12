@@ -107,6 +107,20 @@ class TestVideoStore(unittest.TestCase):
         pending_ids = {row["video_id"] for row in pending}
         self.assertEqual(pending_ids, {"p1", "p2"})
 
+    def test_download_queue_lifecycle(self):
+        queued = make_video("q1")
+        self.assertTrue(self.store.enqueue_download_candidate(queued))
+        self.assertEqual(self.store.get_download_queue_count(), 1)
+
+        candidates = self.store.list_download_candidates(limit=10)
+        self.assertEqual([candidate.video_id for candidate in candidates], ["q1"])
+
+        self.store.insert_or_update(queued, file_path="/tmp/q1.mp4")
+        self.assertTrue(self.store.delete_download_candidate("q1", "youtube"))
+        self.assertEqual(self.store.get_download_queue_count(), 0)
+
+        self.assertFalse(self.store.enqueue_download_candidate(queued))
+
     def test_update_status(self):
         self.store.insert_or_update(make_video("u1"), file_path="/tmp/u1.mp4")
         self.store.update_status("u1", "youtube", "v2_failed", "face_not_found")

@@ -9,11 +9,11 @@ from core.storage.video_store import VideoStore
 
 logger = get_logger(__name__)
 claim_lock = threading.Lock()
-PIPELINE_STAGES = ("search", "download", "v1", "v2")
+PIPELINE_STAGES = ("search", "v1", "download", "v2")
 NEXT_PIPELINE_STAGE = {
-    "search": "download",
-    "download": "v1",
-    "v1": "v2",
+    "search": "v1",
+    "v1": "download",
+    "download": "v2",
 }
 
 VU = None
@@ -67,6 +67,12 @@ def _is_downloaded_file_path(file_path) -> bool:
 
 
 def _normalize_resume_stage(stage):
+    if stage == "v1":
+        logger.warning(
+            "Pipeline run was checkpointed at v1, but search results are not durable; "
+            "restarting from search"
+        )
+        return "search"
     if stage in PIPELINE_STAGES:
         return stage
     logger.warning(f"Unknown pipeline resume stage '{stage}', restarting from search")
@@ -238,12 +244,77 @@ def run_pipeline(config=None):
                         search_config=search_cfg
                     )
 
-        # 初始化 V2，实际启动延后到 v1 阶段之后，便于按阶段恢复。
+        def enqueue_v1_candidates(videos):
+            queued = 0
+            for video in videos:
+                if video_store.enqueue_download_candidate(video):
+                    queued += 1
+            logger.info(f"Queued {queued}/{len(videos)} V1-passed videos for download")
+            return queued
+
+        def download_queued_candidates(limit=None):
+            ensure_stage_components()
+            candidate_limit = limit or pipeline_cfg.get(
+                'download_queue_limit',
+                max(
+                    1,
+                    pipeline_cfg.get('batch_size', 10)
+                    * search_cfg.get('per_platform_results', 20)
+                    * max(1, len(enabled_platforms)),
+                ),
+            )
+            candidates = video_store.list_download_candidates(limit=candidate_limit)
+            if not candidates:
+                logger.info("No V1-passed download candidates are queued")
+                return 0
+
+            downloaded_count = 0
+            for video in candidates:
+                existing = video_store.get_video_by_id(video.video_id, video.platform)
+                if existing is not None:
+                    video_store.delete_download_candidate(video.video_id, video.platform)
+                    logger.info(
+                        f"Removed stale download candidate for existing video "
+                        f"{video.platform}:{video.video_id}"
+                    )
+                    continue
+
+                try:
+                    downloaded = downloader.download([video.url])
+                except Exception as download_exc:
+                    logger.error(
+                        f"Download failed for {video.platform}:{video.video_id}: {download_exc}",
+                        exc_info=True,
+                    )
+                    continue
+
+                file_path = downloaded.get(video.url)
+                if not _is_downloaded_file_path(file_path):
+                    logger.warning(
+                        "Keeping %s:%s in download queue because download did not produce a valid file: %r",
+                        video.platform,
+                        video.video_id,
+                        file_path,
+                    )
+                    continue
+
+                if video_store.insert_or_update(video, file_path):
+                    video_store.delete_download_candidate(video.video_id, video.platform)
+                    downloaded_count += 1
+                    logger.info(
+                        f"Downloaded and enqueued for V2: {video.platform}:{video.video_id}"
+                    )
+            return downloaded_count
+
+        # V2 can run from process startup and will pick up each successful download.
         if enable_v2:
             v2_config = dict(config.get('v2_filter', {}))
             v2_config['project'] = config.get('project', {})
             v2_filter = V2ContentFilter(v2_config, video_store, explorer)
-        v2_started = False
+            v2_filter.start()
+            v2_started = True
+        else:
+            v2_started = False
         loop_retry_attempt = 0
 
         while True:
@@ -266,51 +337,59 @@ def run_pipeline(config=None):
                     for attempt in range(max_retries + 1):
                         try:
                             videos = []
+                            search_completed = False
                             if _skip_stage(resume_stage, "search"):
                                 logger.info(f"Skipping search stage for run {run_id}")
                             else:
                                 max_results = search_cfg.get('per_platform_results', 20)
                                 for searcher in searchers.values():
                                     videos.extend(searcher.search(term.text, max_results=max_results))
-                            _advance_pipeline_stage(video_store, run_id, "search")
+                                search_completed = True
+                            if search_completed:
+                                _advance_pipeline_stage(video_store, run_id, "search")
 
-                            downloaded = {}
-                            if _skip_stage(resume_stage, "download"):
-                                logger.info(f"Skipping download stage for run {run_id}")
-                            else:
-                                try:
-                                    downloaded = downloader.download([video.url for video in videos])
-                                except Exception as download_exc:
-                                    logger.error(
-                                        f"Download failed for term '{term.text}': {download_exc}",
-                                        exc_info=True
-                                    )
-                            _advance_pipeline_stage(video_store, run_id, "download")
-
+                            v1_completed = False
                             if _skip_stage(resume_stage, "v1"):
                                 logger.info(f"Skipping v1 stage for run {run_id}")
                             else:
                                 passed, feedback_v1 = v1.filter(videos, term.text)
                                 explorer.receive_feedback(feedback_v1)
+                                enqueue_v1_candidates(passed)
+                                v1_completed = True
+                            if v1_completed:
+                                _advance_pipeline_stage(video_store, run_id, "v1")
 
-                                # Only enqueue videos that have a real local file.
-                                # Rows in "downloaded" state are immediately visible to V2.
-                                for video in passed:
-                                    file_path = downloaded.get(video.url)
-                                    if not _is_downloaded_file_path(file_path):
-                                        logger.warning(
-                                            "Skipping V2 enqueue for %s:%s because download did not produce a valid file: %r",
-                                            video.platform,
-                                            video.video_id,
-                                            file_path,
+                            if _skip_stage(resume_stage, "download"):
+                                logger.info(f"Skipping download stage for run {run_id}")
+                            else:
+                                download_stage_completed = True
+                                downloaded_count = download_queued_candidates()
+                                if (
+                                        resume_stage == "download"
+                                        and downloaded_count == 0
+                                        and video_store.get_download_queue_count() == 0
+                                        and not any(
+                                            stats.get(status, 0) > 0
+                                            for status in (
+                                                "downloaded",
+                                                "v2_in_progress",
+                                                "v2_passed",
+                                                "v2_failed",
+                                                "v2_coarse_failed",
+                                                "v2_fine_failed",
+                                            )
                                         )
-                                        continue
-                                    video_store.insert_or_update(video, file_path)
-                            _advance_pipeline_stage(video_store, run_id, "v1")
-
-                            if enable_v2 and not v2_started and not _skip_stage(resume_stage, "v2"):
-                                v2_filter.start()
-                                v2_started = True
+                                ):
+                                    logger.warning(
+                                        f"Resume stage download has no durable V1 candidates for run {run_id}; "
+                                        "resetting to search"
+                                    )
+                                    video_store.update_pipeline_run_stage(run_id, "search")
+                                    ensure_stage_components()
+                                    resume_stage = "search"
+                                    download_stage_completed = False
+                                if download_stage_completed:
+                                    _advance_pipeline_stage(video_store, run_id, "download")
 
                             # 可选：打印当前存储统计
                             stats = video_store.get_statistics()

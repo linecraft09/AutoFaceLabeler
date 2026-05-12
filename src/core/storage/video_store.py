@@ -75,6 +75,7 @@ class VideoStore:
             """)
             self._init_embeddings_table(conn)
             self._init_v2_progress_table(conn)
+            self._init_download_queue_table(conn)
             self._init_pipeline_run_table(conn)
             self._migrate_schema(conn)
             conn.execute("""
@@ -120,6 +121,31 @@ class VideoStore:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(video_id, platform, stage)
             )
+        """)
+
+    def _init_download_queue_table(self, conn: sqlite3.Connection):
+        """Initialize durable V1-passed candidates waiting for download."""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS download_queue (
+                video_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                title TEXT,
+                duration_seconds INTEGER,
+                resolution TEXT,
+                channel TEXT,
+                publish_date TEXT,
+                view_count INTEGER,
+                tags TEXT,
+                search_term TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(video_id, platform)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_download_queue_created
+            ON download_queue(created_at)
         """)
 
     def _init_pipeline_run_table(self, conn: sqlite3.Connection):
@@ -632,6 +658,85 @@ class VideoStore:
     def insert_or_update_video(self, video: VideoMeta, file_path: Optional[str] = None) -> bool:
         """Compatibility alias for callers using the older explicit method name."""
         return self.insert_or_update(video, file_path=file_path)
+
+    def enqueue_download_candidate(self, video: VideoMeta) -> bool:
+        """
+        Persist a V1-passed candidate for later download.
+
+        The candidate queue is separate from the main videos table so V2 only
+        sees rows with a successful local download.
+        """
+        existing = self.get_video_by_id(video.video_id, video.platform)
+        if existing is not None:
+            logger.debug(
+                f"Skip download queue for existing video {video.platform}:{video.video_id}"
+            )
+            return False
+
+        try:
+            with self._connect() as conn:
+                conn.execute("""
+                    INSERT INTO download_queue (
+                        video_id, url, platform, title, duration_seconds, resolution,
+                        channel, publish_date, view_count, tags, search_term, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(video_id, platform) DO UPDATE SET
+                        url = excluded.url,
+                        title = excluded.title,
+                        duration_seconds = excluded.duration_seconds,
+                        resolution = excluded.resolution,
+                        channel = excluded.channel,
+                        publish_date = excluded.publish_date,
+                        view_count = excluded.view_count,
+                        tags = excluded.tags,
+                        search_term = excluded.search_term,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (
+                    video.video_id,
+                    video.url,
+                    video.platform,
+                    video.title,
+                    video.duration_seconds,
+                    video.resolution,
+                    video.channel,
+                    video.publish_date,
+                    video.view_count,
+                    json.dumps(video.tags),
+                    video.search_term,
+                ))
+            return True
+        except Exception as e:
+            logger.error(f"Failed to queue download candidate {video.video_id}: {e}")
+            return False
+
+    def list_download_candidates(self, limit: int = 100) -> List[VideoMeta]:
+        """Return V1-passed candidates waiting for download."""
+        limit = max(1, int(limit))
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT *
+                FROM download_queue
+                ORDER BY created_at, rowid
+                LIMIT ?
+            """, (limit,))
+            rows = cursor.fetchall()
+            return [self._row_to_video_meta(dict(row)) for row in rows]
+
+    def delete_download_candidate(self, video_id: str, platform: str) -> bool:
+        """Remove one candidate from the durable download queue."""
+        with self._connect() as conn:
+            cursor = conn.execute("""
+                DELETE FROM download_queue
+                WHERE video_id = ? AND platform = ?
+            """, (video_id, platform))
+            return cursor.rowcount == 1
+
+    def get_download_queue_count(self) -> int:
+        """Return the number of V1-passed candidates still waiting for download."""
+        with self._connect() as conn:
+            cursor = conn.execute("SELECT COUNT(*) FROM download_queue")
+            return int(cursor.fetchone()[0])
 
     def update_status(
         self,
