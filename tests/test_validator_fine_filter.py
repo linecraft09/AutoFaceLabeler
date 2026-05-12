@@ -11,6 +11,7 @@ SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
 sys.path.insert(0, SRC_ROOT)
 
 from validators.validator import V2ContentFilter
+from validators.v2_models.scrfd_batch_detector import Detection
 
 
 class FakeFaceEmbedder:
@@ -160,6 +161,57 @@ class TestValidatorFineFilter(unittest.TestCase):
         self.assertEqual(fail_reason, 'merged_duration_too_short')
         unlink.assert_called_once_with('merged.mp4')
         self.assertEqual(embedder.added_embeddings, [])
+
+    def test_primary_only_selects_largest_face_per_frame(self):
+        filt = V2ContentFilter.__new__(V2ContentFilter)
+        filt.face_primary_only = True
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        small = Detection(
+            bbox=np.array([10, 10, 30, 30], dtype=np.float32),
+            score=0.99,
+        )
+        large = Detection(
+            bbox=np.array([20, 20, 80, 70], dtype=np.float32),
+            score=0.75,
+        )
+
+        selected = filt._select_frame_detections(frame, [small, large])
+
+        self.assertEqual(len(selected), 1)
+        self.assertIs(selected[0][0], large)
+
+    def test_primary_only_disabled_keeps_all_valid_faces(self):
+        filt = V2ContentFilter.__new__(V2ContentFilter)
+        filt.face_primary_only = False
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        detections = [
+            Detection(
+                bbox=np.array([10, 10, 30, 30], dtype=np.float32),
+                score=0.99,
+            ),
+            Detection(
+                bbox=np.array([20, 20, 80, 70], dtype=np.float32),
+                score=0.75,
+            ),
+        ]
+
+        selected = filt._select_frame_detections(frame, detections)
+
+        self.assertEqual([item[0] for item in selected], detections)
+
+    def test_format_pose_stats_reports_axis_and_max_abs_distribution(self):
+        poses = [
+            np.array([1.0, -2.0, 3.0], dtype=np.float32),
+            np.array([-4.0, 5.0, -6.0], dtype=np.float32),
+        ]
+
+        stats = V2ContentFilter._format_pose_stats(poses)
+
+        self.assertIn("n=2", stats)
+        self.assertIn("pitch_abs=", stats)
+        self.assertIn("yaw_abs=", stats)
+        self.assertIn("roll_abs=", stats)
+        self.assertIn("max_abs=", stats)
 
 
 if __name__ == '__main__':

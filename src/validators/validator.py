@@ -58,6 +58,7 @@ class V2ContentFilter:
         self.laplacian_threshold = laplacian_cfg.get('threshold', 100)
         self.laplacian_required_ratio = laplacian_cfg.get('required_ratio', 0.8)
         self.face_required_ratio = face_cfg.get('required_ratio', 0.8)
+        self.face_primary_only = bool(face_cfg.get('primary_only', False))
         self.dedup_threshold = fine_cfg.get('dedup_threshold', 0.7)
         self.min_qualified_duration = float(fine_cfg.get('min_duration', 30))
         self.batch_size = int(fine_cfg.get('batch_size', 16))
@@ -597,17 +598,16 @@ class V2ContentFilter:
         landmark_frames = []
         landmark_bboxes = []
         clarity_crops = []
+        clarity_crop_sizes = []
         for frame, detections in zip(sampled_frames, detections_by_frame):
-            for detection in detections:
-                bbox = self._clip_bbox(detection.bbox, frame.shape)
-                if bbox is None:
-                    continue
+            for detection, bbox in self._select_frame_detections(frame, detections):
                 x1, y1, x2, y2 = bbox.tolist()
                 face_crop = frame[y1:y2, x1:x2]
                 if face_crop.size == 0:
                     continue
 
                 clarity_crops.append(face_crop)
+                clarity_crop_sizes.append((x2 - x1, y2 - y1))
                 landmark_frames.append(frame)
                 landmark_bboxes.append(bbox.astype(np.float32))
                 arcface_crops.append(self._make_arcface_crop(frame, face_crop, detection))
@@ -628,15 +628,35 @@ class V2ContentFilter:
         )
         pose_ratio = good_pose_count / total_faces
 
+        clarity_values = [
+            float(compute_laplacian_variance(face_crop))
+            for face_crop in clarity_crops
+        ]
         good_clarity_count = sum(
-            1 for face_crop in clarity_crops
-            if compute_laplacian_variance(face_crop) > self.laplacian_threshold
+            1 for clarity_value in clarity_values
+            if clarity_value > self.laplacian_threshold
         )
         clarity_ratio = good_clarity_count / total_faces
 
         if pose_ratio < self.head_pose_required_ratio:
+            self._log_head_pose_rejection(
+                video_path,
+                pose_ratio,
+                poses,
+                clarity_crop_sizes,
+                total_faces,
+                len(sampled_frames),
+            )
             return video_path, False, None, 'head_pose_out_of_range'
         if clarity_ratio < self.laplacian_required_ratio:
+            self._log_blurry_face_rejection(
+                video_path,
+                clarity_ratio,
+                clarity_values,
+                clarity_crop_sizes,
+                total_faces,
+                len(sampled_frames),
+            )
             return video_path, False, None, 'blurry_face'
 
         return video_path, True, (pose_ratio, clarity_ratio, representative_embedding), None
@@ -662,6 +682,113 @@ class V2ContentFilter:
         if x2 <= x1 or y2 <= y1:
             return None
         return np.array([x1, y1, x2, y2], dtype=int)
+
+    def _select_frame_detections(
+        self,
+        frame: np.ndarray,
+        detections: List[Detection],
+    ) -> List[Tuple[Detection, np.ndarray]]:
+        selected = []
+        for detection in detections:
+            bbox = self._clip_bbox(detection.bbox, frame.shape)
+            if bbox is None:
+                continue
+            selected.append((detection, bbox))
+
+        if not self.face_primary_only or len(selected) <= 1:
+            return selected
+
+        return [max(selected, key=lambda item: (self._bbox_area(item[1]), item[0].score))]
+
+    @staticmethod
+    def _bbox_area(bbox: np.ndarray) -> int:
+        x1, y1, x2, y2 = bbox.tolist()
+        return max(x2 - x1, 0) * max(y2 - y1, 0)
+
+    def _log_head_pose_rejection(
+        self,
+        video_path: str,
+        pose_ratio: float,
+        poses: List[np.ndarray],
+        crop_sizes: List[Tuple[int, int]],
+        total_faces: int,
+        sampled_frame_count: int,
+    ) -> None:
+        threshold = float(self.max_head_angle)
+        good_pose_count = sum(
+            1 for pose in poses
+            if np.all(np.abs(pose) <= threshold)
+        )
+        logger.info(
+            "Fine filter rejected %s for head_pose_out_of_range: "
+            "pose_ratio=%.3f required_ratio=%.3f max_angle=%.2f "
+            "good_poses=%d/%d sampled_frames=%d primary_only=%s "
+            "pose=%s min_face_edge=%s",
+            video_path,
+            pose_ratio,
+            float(self.head_pose_required_ratio),
+            threshold,
+            good_pose_count,
+            total_faces,
+            sampled_frame_count,
+            self.face_primary_only,
+            self._format_pose_stats(poses),
+            self._format_numeric_stats([min(width, height) for width, height in crop_sizes]),
+        )
+
+    def _log_blurry_face_rejection(
+        self,
+        video_path: str,
+        clarity_ratio: float,
+        clarity_values: List[float],
+        crop_sizes: List[Tuple[int, int]],
+        total_faces: int,
+        sampled_frame_count: int,
+    ) -> None:
+        min_face_edges = [min(width, height) for width, height in crop_sizes]
+        logger.info(
+            "Fine filter rejected %s for blurry_face: "
+            "clarity_ratio=%.3f required_ratio=%.3f threshold=%.2f "
+            "good_faces=%d/%d sampled_frames=%d primary_only=%s "
+            "laplacian=%s min_face_edge=%s",
+            video_path,
+            clarity_ratio,
+            float(self.laplacian_required_ratio),
+            float(self.laplacian_threshold),
+            sum(1 for value in clarity_values if value > self.laplacian_threshold),
+            total_faces,
+            sampled_frame_count,
+            self.face_primary_only,
+            self._format_numeric_stats(clarity_values),
+            self._format_numeric_stats(min_face_edges),
+        )
+
+    @staticmethod
+    def _format_pose_stats(poses: List[np.ndarray]) -> str:
+        if not poses:
+            return "n=0"
+        arr = np.asarray(poses, dtype=np.float32).reshape((-1, 3))
+        abs_arr = np.abs(arr)
+        max_abs = np.max(abs_arr, axis=1)
+        return (
+            f"n={arr.shape[0]} "
+            f"pitch_abs=({V2ContentFilter._format_numeric_stats(abs_arr[:, 0].tolist())}) "
+            f"yaw_abs=({V2ContentFilter._format_numeric_stats(abs_arr[:, 1].tolist())}) "
+            f"roll_abs=({V2ContentFilter._format_numeric_stats(abs_arr[:, 2].tolist())}) "
+            f"max_abs=({V2ContentFilter._format_numeric_stats(max_abs.tolist())})"
+        )
+
+    @staticmethod
+    def _format_numeric_stats(values: List[float]) -> str:
+        if not values:
+            return "n=0"
+        arr = np.asarray(values, dtype=np.float32)
+        p25, median, p75 = np.percentile(arr, [25, 50, 75])
+        return (
+            f"n={arr.size} min={float(np.min(arr)):.2f} p25={float(p25):.2f} "
+            f"median={float(median):.2f} p75={float(p75):.2f} "
+            f"max={float(np.max(arr)):.2f}"
+        )
 
     @staticmethod
     def _make_arcface_crop(frame: np.ndarray, face_crop: np.ndarray, detection: Detection) -> np.ndarray:

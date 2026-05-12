@@ -176,6 +176,9 @@ v2_filter:
     head_pose:
       max_angle: 10
       required_ratio: 0.8
+    face:
+      required_ratio: 0.8
+      primary_only: true
     laplacian:
       threshold: 100
       required_ratio: 0.8
