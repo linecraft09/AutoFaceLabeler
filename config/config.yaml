@@ -174,14 +174,14 @@ v2_filter:
     dedup_threshold: 0.75
     speech_required: true
     head_pose:
-      max_angle: 10
-      required_ratio: 0.8
+      max_angle: 20
+      required_ratio: 0.5
     face:
-      required_ratio: 0.8
+      required_ratio: 0.75
       primary_only: true
     laplacian:
-      threshold: 100
-      required_ratio: 0.8
+      threshold: 80
+      required_ratio: 0.6
     sampling:
       rate: 0.1
       max_frames: 200
