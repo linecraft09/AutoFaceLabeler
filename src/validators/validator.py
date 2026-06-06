@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -397,25 +398,29 @@ class V2ContentFilter:
             self._cleanup_checkpoint(video_id, platform)
 
     def _coarse_filter(self, video_path: str) -> Tuple[bool, Optional[str], List[str]]:
-        segments, total_single_secs = self.yolo.detect_single_person_segments(video_path)
-        self._last_coarse_segments = segments
-        total_secs = VU.get_video_secs(video_path)
-        if total_secs == 0:
-            return False, 'no_frames', []
-        single_ratio = total_single_secs / total_secs
-        if single_ratio < self.single_person_threshold:
-            return False, 'no_single_person', []
+        try:
+            segments, total_single_secs = self.yolo.detect_single_person_segments(video_path)
+            self._last_coarse_segments = segments
+            total_secs = VU.get_video_secs(video_path)
+            if total_secs == 0:
+                return False, 'no_frames', []
+            single_ratio = total_single_secs / total_secs
+            if single_ratio < self.single_person_threshold:
+                return False, 'no_single_person', []
 
-        # 闂婃娊?濡�?????
-        if self.audio_required:
-            has_audio = VU.check_audio(video_path)
-            if not has_audio:
-                return False, 'no_audio', []
+            # 闂婃娊?濡�?????
+            if self.audio_required:
+                has_audio = VU.check_audio(video_path)
+                if not has_audio:
+                    return False, 'no_audio', []
 
-        clip_file_paths = VU.clip_video(video_path, segments, unit="second")
-        if clip_file_paths is None or len(clip_file_paths) == 0:
-            return False, 'clip_failed', []
-        return True, None, clip_file_paths
+            clip_file_paths = VU.clip_video(video_path, segments, unit="second")
+            if clip_file_paths is None or len(clip_file_paths) == 0:
+                return False, 'clip_failed', []
+            return True, None, clip_file_paths
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            logger.error(f"Coarse filter failed for {video_path}: {e}", exc_info=True)
+            return False, f"coarse_exception: {e}", []
 
     def _fine_filter(
         self,

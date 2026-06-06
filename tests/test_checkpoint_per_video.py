@@ -113,6 +113,26 @@ def test_coarse_cache_saved_and_loaded(monkeypatch, tmp_path, video_store, filte
     assert fake_yolo.calls == 1
 
 
+def test_coarse_runtime_error_marks_video_failed(monkeypatch, tmp_path, video_store, filter_factory):
+    video_file = tmp_path / "encoding_error.mp4"
+    video_file.write_bytes(b"video")
+    video_store.insert_or_update(make_video_meta("encoding_error", str(video_file)), file_path=str(video_file))
+    filt, fake_yolo = filter_factory()
+
+    def raise_encoding_error(video_path):
+        fake_yolo.calls += 1
+        raise RuntimeError("ffmpeg sample generation failed")
+
+    monkeypatch.setattr(fake_yolo, "detect_single_person_segments", raise_encoding_error)
+
+    filt._process_video(make_row("encoding_error", video_file))
+
+    row = video_store.get_video_by_id("encoding_error", "youtube")
+    assert row["status"] == "v2_coarse_failed"
+    assert "coarse_exception: ffmpeg sample generation failed" in row["v2_fail_reason"]
+    assert fake_yolo.calls == 1
+
+
 def test_fine_progress_tracked(monkeypatch, tmp_path, video_store, filter_factory):
     video_file = tmp_path / "test2.mp4"
     video_file.write_bytes(b"video")

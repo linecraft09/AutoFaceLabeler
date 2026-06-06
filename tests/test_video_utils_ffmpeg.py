@@ -41,6 +41,8 @@ def test_sample_video_per_sec_falls_back_to_libx264_and_forces_8bit(monkeypatch,
     assert calls[1][1] is False
     assert "fps=1,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p" in calls[0][0]
     assert "fps=1,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p" in calls[1][0]
+    assert calls[0][0][calls[0][0].index("-pix_fmt") + 1] == "yuv420p"
+    assert calls[1][0][calls[1][0].index("-pix_fmt") + 1] == "yuv420p"
     assert "-hwaccel" not in calls[0][0]
 
 
@@ -66,6 +68,7 @@ def test_sample_video_per_sec_uses_software_when_nvenc_unavailable(monkeypatch, 
     assert len(calls) == 1
     assert "libx264" in calls[0][0]
     assert "h264_nvenc" not in calls[0][0]
+    assert calls[0][0][calls[0][0].index("-pix_fmt") + 1] == "yuv420p"
 
 
 def test_clip_video_uses_copy_then_software_fallback_with_mkv_output(monkeypatch, tmp_path):
