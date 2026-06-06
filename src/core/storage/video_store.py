@@ -77,6 +77,7 @@ class VideoStore:
             self._init_v2_progress_table(conn)
             self._init_download_queue_table(conn)
             self._init_pipeline_run_table(conn)
+            self._init_annotation_run_table(conn)
             self._migrate_schema(conn)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_status ON videos(status)
@@ -163,6 +164,24 @@ class VideoStore:
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_pipeline_run_status
             ON pipeline_run(status, updated_at)
+        """)
+
+    def _init_annotation_run_table(self, conn: sqlite3.Connection):
+        """Initialize restart checkpoints for annotation pipeline runs."""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS annotation_runs (
+                run_id TEXT PRIMARY KEY,
+                stage TEXT NOT NULL DEFAULT 'pending',
+                status TEXT NOT NULL DEFAULT 'in_progress',
+                target_count INTEGER DEFAULT 200,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_annotation_runs_status
+            ON annotation_runs(status, updated_at)
         """)
 
     def _migrate_schema(self, conn: sqlite3.Connection):
@@ -348,6 +367,94 @@ class VideoStore:
             """, (keep_last,))
             deleted = cursor.rowcount
         logger.info(f"Pruned {deleted} old pipeline runs")
+        return deleted
+
+    def create_annotation_run(self, run_id: str, stage: str = "pending") -> None:
+        """Create a new in-progress annotation run checkpoint."""
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT INTO annotation_runs (
+                    run_id, stage, status, target_count,
+                    created_at, updated_at, completed_at
+                ) VALUES (?, ?, 'in_progress', 200, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL)
+            """, (run_id, stage))
+        logger.info(f"Created annotation run {run_id} at stage {stage}")
+
+    def update_annotation_run_stage(
+        self,
+        run_id: str,
+        stage: str,
+        status: str = "in_progress"
+    ) -> None:
+        """Update the checkpoint stage for an existing annotation run."""
+        with self._connect() as conn:
+            conn.execute("""
+                UPDATE annotation_runs
+                SET stage = ?,
+                    status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE run_id = ?
+            """, (stage, status, run_id))
+        logger.debug(f"Updated annotation run {run_id} to stage {stage} with status {status}")
+
+    def complete_annotation_run(self, run_id: str) -> None:
+        """Mark an annotation run as completed."""
+        with self._connect() as conn:
+            conn.execute("""
+                UPDATE annotation_runs
+                SET status = 'completed',
+                    completed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE run_id = ?
+            """, (run_id,))
+        logger.info(f"Completed annotation run {run_id}")
+
+    def fail_annotation_run(self, run_id: str) -> None:
+        """Mark an annotation run as failed."""
+        with self._connect() as conn:
+            conn.execute("""
+                UPDATE annotation_runs
+                SET status = 'failed',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE run_id = ?
+            """, (run_id,))
+        logger.info(f"Marked annotation run {run_id} as failed")
+
+    def get_in_progress_annotation_run(self) -> Optional[Dict[str, Any]]:
+        """Return the most recent in-progress annotation run, if any."""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute("""
+                SELECT *
+                FROM annotation_runs
+                WHERE status = 'in_progress'
+                ORDER BY updated_at DESC, created_at DESC, rowid DESC
+                LIMIT 1
+            """)
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def prune_old_annotation_runs(self, keep_last: int = 100) -> int:
+        """Delete older completed/failed annotation runs while preserving in-progress runs."""
+        keep_last = max(0, int(keep_last))
+        with self._connect() as conn:
+            cursor = conn.execute("""
+                DELETE FROM annotation_runs
+                WHERE status IN ('completed', 'failed')
+                  AND run_id NOT IN (
+                      SELECT run_id
+                      FROM annotation_runs
+                      WHERE status IN ('completed', 'failed')
+                      ORDER BY
+                          COALESCE(completed_at, updated_at, created_at) DESC,
+                          updated_at DESC,
+                          created_at DESC,
+                          run_id DESC
+                      LIMIT ?
+                  )
+            """, (keep_last,))
+            deleted = cursor.rowcount
+        logger.info(f"Pruned {deleted} old annotation runs")
         return deleted
 
     def list_pipeline_runs(
