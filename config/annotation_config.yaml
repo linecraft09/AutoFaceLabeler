@@ -1,0 +1,57 @@
+# Milestone 2 annotation pipeline configuration.
+
+annotation:
+  enabled: true
+  target_annotated: 200
+  device: cuda
+  batch_size: 8
+  output_dir: ./data/annotations
+  max_retries: 3
+  timeout_seconds: 900
+
+deepface:
+  enabled: true
+  device: cuda
+  detector_backend: retinaface
+  model_name: VGG-Face
+  actions:
+    - age
+    - race
+    - emotion
+  sample_frames: 16
+  confidence_threshold: 0.5
+
+qwen_vl:
+  enabled: true
+  model: qwen2.5-vl-72b-instruct
+  api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key_env: DASHSCOPE_API_KEY
+  max_frames: 16
+  temperature: 0.2
+  timeout_seconds: 120
+  prompts:
+    facial_motion: Describe visible facial movements over time.
+    expression_intensity: Score expression intensity from 1 to 5.
+
+dwpose:
+  enabled: true
+  device: cuda
+  model_path: models/dwpose/dwpose.onnx
+  batch_size: 16
+  sampling_rate: 0.1
+  max_frames: 200
+  clarity:
+    crop_padding: 0.2
+    min_face_ratio: 0.5
+    laplacian_threshold: 80
+
+whisper:
+  enabled: true
+  device: cuda
+  model_name: large-v3
+  language: auto
+  compute_type: float16
+  beam_size: 5
+  segments:
+    include_timestamps: true
+    include_confidence: true
